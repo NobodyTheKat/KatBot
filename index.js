@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const {
@@ -22,7 +21,7 @@ const {
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 
 if (!process.env.DISCORD_TOKEN) {
   console.error('DISCORD_TOKEN is missing from the .env file.');
@@ -100,6 +99,174 @@ function getSettings(guildId) {
   return config;
 }
 
+/* -------------------- GITHUB UPDATER -------------------- */
+
+function runGit(args) {
+  return spawnSync('git', args, {
+    cwd: __dirname,
+    encoding: 'utf8',
+    timeout: 60000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+}
+
+function updateFromGitHub() {
+  if (!fs.existsSync(path.join(__dirname, '.git'))) {
+    return {
+      ok: false,
+      updated: false,
+      message: 'The .git directory was not found.',
+    };
+  }
+
+  const branch = (process.env.GITHUB_BRANCH || 'main').trim();
+
+  const fetchResult = runGit(['fetch', 'origin', branch]);
+
+  if (fetchResult.status !== 0) {
+    return {
+      ok: false,
+      updated: false,
+      message: fetchResult.stderr || 'Could not fetch updates from GitHub.',
+    };
+  }
+
+  const localResult = runGit(['rev-parse', 'HEAD']);
+  const remoteResult = runGit(['rev-parse', `origin/${branch}`]);
+
+  if (localResult.status !== 0 || remoteResult.status !== 0) {
+    return {
+      ok: false,
+      updated: false,
+      message: 'Could not read Git revisions.',
+    };
+  }
+
+  const local = localResult.stdout.trim();
+  const remote = remoteResult.stdout.trim();
+
+  if (local === remote) {
+    return {
+      ok: true,
+      updated: false,
+      message: 'KatBot is already up to date.',
+    };
+  }
+
+  const ancestorResult = runGit([
+    'merge-base',
+    '--is-ancestor',
+    'HEAD',
+    `origin/${branch}`,
+  ]);
+
+  if (ancestorResult.status !== 0) {
+    return {
+      ok: false,
+      updated: false,
+      message:
+        'The update is not a safe fast-forward. No changes were applied.',
+    };
+  }
+
+  const changedResult = runGit([
+    'diff',
+    '--name-only',
+    'HEAD',
+    `origin/${branch}`,
+  ]);
+
+  if (changedResult.status !== 0) {
+    return {
+      ok: false,
+      updated: false,
+      message: 'Could not inspect the update.',
+    };
+  }
+
+  const changedFiles = changedResult.stdout
+    .split(/\r?\n/)
+    .map((file) => file.trim());
+
+  const dependenciesChanged = changedFiles.some((file) =>
+    ['package.json', 'package-lock.json'].includes(file)
+  );
+
+  const mergeResult = runGit([
+    'merge',
+    '--ff-only',
+    `origin/${branch}`,
+  ]);
+
+  if (mergeResult.status !== 0) {
+    return {
+      ok: false,
+      updated: false,
+      message: mergeResult.stderr || 'Git could not apply the update.',
+    };
+  }
+
+  if (dependenciesChanged) {
+    const installResult = spawnSync('npm', ['ci'], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      timeout: 180000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+
+    if (installResult.status !== 0) {
+      console.error('npm ci failed:', installResult.stderr);
+
+      return {
+        ok: false,
+        updated: true,
+        message:
+          'Source code updated, but dependency installation failed. Check Termux before restarting.',
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    updated: true,
+    message: `GitHub update downloaded: ${local.slice(0, 7)} → ${remote.slice(0, 7)}.`,
+  };
+}
+
+let restartScheduled = false;
+
+function restartBot() {
+  if (restartScheduled) return;
+  restartScheduled = true;
+
+  console.log('Restarting KatBot...');
+
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, 'index.js')],
+    {
+      cwd: __dirname,
+      env: process.env,
+      detached: true,
+      stdio: 'ignore',
+    }
+  );
+
+  child.once('error', (error) => {
+    console.error('Could not start replacement process:', error);
+    restartScheduled = false;
+  });
+
+  child.unref();
+
+  setTimeout(() => {
+    client.destroy();
+    process.exit(0);
+  }, 2000);
+}
+
+/* -------------------- BOT CONFIGURATION -------------------- */
+
 const activityTypes = {
   playing: ActivityType.Playing,
   watching: ActivityType.Watching,
@@ -167,9 +334,7 @@ function rotateStatus() {
     });
   }
 
-  if (statusTimer) {
-    clearTimeout(statusTimer);
-  }
+  if (statusTimer) clearTimeout(statusTimer);
 
   const intervals = Object.values(settings).map(
     (server) => Number(server.statusInterval) || 60
@@ -181,10 +346,7 @@ function rotateStatus() {
 }
 
 function refreshStatusNow() {
-  if (statusTimer) {
-    clearTimeout(statusTimer);
-  }
-
+  if (statusTimer) clearTimeout(statusTimer);
   statusIndex = 0;
   rotateStatus();
 }
@@ -198,8 +360,8 @@ function cleanCommandName(input) {
 }
 
 function isValidCommandName(name) {
-  return /^[a-z0-9_-]{1,32}$/.test(name)
-    && !['setup', 'ping', 'update'].includes(name);
+  return /^[a-z0-9_-]{1,32}$/.test(name) &&
+    !['setup', 'ping', 'update'].includes(name);
 }
 
 async function syncGuildCustomCommands(guildId) {
@@ -244,9 +406,7 @@ function panelEmbed(title, description) {
     .setColor(0x5865f2)
     .setTitle(title)
     .setDescription(description)
-    .setFooter({
-      text: 'KatBot • Changes are saved automatically',
-    });
+    .setFooter({ text: 'KatBot • Changes are saved automatically' });
 }
 
 function mainPanelRows() {
@@ -286,30 +446,25 @@ function welcomePanel(guildId) {
   return {
     embeds: [
       panelEmbed(
-        '👋 Welcome',
+        'Welcome',
         `**Welcome DMs:** ${config.welcomeEnabled ? 'Enabled' : 'Disabled'}\n` +
         `**Current message:**\n${config.welcomeMessage}\n\n` +
         'Available placeholders: `{user}` and `{server}`.'
       ),
     ],
-
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('welcome_toggle')
           .setLabel(config.welcomeEnabled ? 'Disable DMs' : 'Enable DMs')
           .setStyle(
-            config.welcomeEnabled
-              ? ButtonStyle.Danger
-              : ButtonStyle.Success
+            config.welcomeEnabled ? ButtonStyle.Danger : ButtonStyle.Success
           ),
-
         new ButtonBuilder()
           .setCustomId('welcome_edit')
           .setLabel('Edit Message')
           .setStyle(ButtonStyle.Primary)
       ),
-
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('setup_home')
@@ -324,48 +479,41 @@ function statusesPanel(guildId) {
   const config = getSettings(guildId);
 
   const statusList = config.statuses.length
-    ? config.statuses
-        .map((status, index) =>
-          `**${index + 1}.** ${activityLabels[status.type] || status.type} **${status.text}**`
-        )
-        .join('\n')
+    ? config.statuses.map((status, index) =>
+        `**${index + 1}.** ${activityLabels[status.type] || status.type} **${status.text}**`
+      ).join('\n')
     : 'No activities have been added yet.';
 
   return {
     embeds: [
       panelEmbed(
-        '🎮 Bot Statuses',
+        'Bot Statuses',
         `${statusList}\n\n**Interval:** ${config.statusInterval} seconds\n\n` +
-        'Note: the bot presence is global on Discord; activities configured across servers are combined into the same rotation.'
+        'Activities configured across servers are combined into the same global rotation.'
       ),
     ],
-
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('status_add')
           .setLabel('Add Activity')
           .setStyle(ButtonStyle.Success),
-
         new ButtonBuilder()
           .setCustomId('status_edit_select')
           .setLabel('Edit Activity')
           .setStyle(ButtonStyle.Primary)
           .setDisabled(config.statuses.length === 0),
-
         new ButtonBuilder()
           .setCustomId('status_delete_select')
           .setLabel('Delete Activity')
           .setStyle(ButtonStyle.Danger)
           .setDisabled(config.statuses.length === 0)
       ),
-
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('status_interval_edit')
           .setLabel('Change Interval')
           .setStyle(ButtonStyle.Secondary),
-
         new ButtonBuilder()
           .setCustomId('setup_home')
           .setLabel('Back to Panel')
@@ -380,41 +528,35 @@ function commandsPanel(guildId) {
   const entries = Object.entries(config.customCommands);
 
   const description = entries.length
-    ? entries
-        .map(([name, response]) =>
-          `**/${name}** → ${response.slice(0, 120)}`
-        )
-        .join('\n')
+    ? entries.map(([name, response]) =>
+        `**/${name}** → ${response.slice(0, 120)}`
+      ).join('\n')
     : 'No custom commands have been created yet.';
 
   return {
     embeds: [
       panelEmbed(
-        '🛠️ Custom Commands',
-        `${description}\n\nCommands created here are registered in this server and can be used as slash commands. Updates may take a few seconds.`
+        'Custom Commands',
+        `${description}\n\nCommands created here are registered as slash commands in this server.`
       ),
     ],
-
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('custom_add')
           .setLabel('Create Command')
           .setStyle(ButtonStyle.Success),
-
         new ButtonBuilder()
           .setCustomId('custom_edit_select')
           .setLabel('Edit Response')
           .setStyle(ButtonStyle.Primary)
           .setDisabled(entries.length === 0),
-
         new ButtonBuilder()
           .setCustomId('custom_delete_select')
           .setLabel('Delete Command')
           .setStyle(ButtonStyle.Danger)
           .setDisabled(entries.length === 0)
       ),
-
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('setup_home')
@@ -435,9 +577,7 @@ function statusSelectRow(guildId, action) {
       .addOptions(
         statuses.slice(0, 25).map((status, index) => ({
           label: `${index + 1}. ${status.text}`.slice(0, 100),
-          description: (
-            activityLabels[status.type] || status.type
-          ).slice(0, 100),
+          description: (activityLabels[status.type] || status.type).slice(0, 100),
           value: String(index),
         }))
       )
@@ -445,9 +585,7 @@ function statusSelectRow(guildId, action) {
 }
 
 function commandSelectRow(guildId, action) {
-  const commands = Object.entries(
-    getSettings(guildId).customCommands
-  ).slice(0, 25);
+  const commands = Object.entries(getSettings(guildId).customCommands).slice(0, 25);
 
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -463,9 +601,7 @@ function commandSelectRow(guildId, action) {
 }
 
 function statusModal(customId, title, status = null) {
-  const modal = new ModalBuilder()
-    .setCustomId(customId)
-    .setTitle(title);
+  const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
 
   const typeInput = new TextInputBuilder()
     .setCustomId('activity_type')
@@ -493,9 +629,7 @@ function statusModal(customId, title, status = null) {
 }
 
 function customCommandModal(customId, title, name = '', response = '') {
-  const modal = new ModalBuilder()
-    .setCustomId(customId)
-    .setTitle(title);
+  const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
 
   const nameInput = new TextInputBuilder()
     .setCustomId('command_name')
@@ -543,6 +677,8 @@ async function showHome(interaction, update = false) {
   return interaction.reply(payload);
 }
 
+/* -------------------- EVENTS -------------------- */
+
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`KatBot is online as ${readyClient.user.tag}`);
 
@@ -580,11 +716,11 @@ client.on(Events.GuildMemberAdd, async (member) => {
   try {
     await member.send(message);
   } catch {
-    console.log(
-      `Cannot send a DM to ${member.user.tag}; their DMs may be disabled.`
-    );
+    console.log(`Cannot send a DM to ${member.user.tag}; their DMs may be disabled.`);
   }
 });
+
+/* -------------------- INTERACTIONS -------------------- */
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
@@ -606,11 +742,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (name === 'update') {
-        if (
-          !interaction.memberPermissions?.has(
-            PermissionFlagsBits.Administrator
-          )
-        ) {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
           return interaction.reply({
             content: 'Only administrators can use /update.',
             ephemeral: true,
@@ -619,140 +751,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.deferReply({ ephemeral: true });
 
-        if (!fs.existsSync(path.join(__dirname, '.git'))) {
-          return interaction.editReply(
-            'Update unavailable: the .git directory was not found.'
-          );
-        }
-
-        const runGit = (args) =>
-          spawnSync('git', args, {
-            cwd: __dirname,
-            encoding: 'utf8',
-            timeout: 60000,
-            maxBuffer: 2 * 1024 * 1024,
-          });
-
         try {
-          const branchResult = runGit(['branch', '--show-current']);
+          const result = updateFromGitHub();
 
-          if (branchResult.status !== 0) {
-            throw new Error(
-              branchResult.stderr || 'Could not determine the Git branch.'
-            );
+          if (!result.ok) {
+            return interaction.editReply(`Update failed: ${result.message}`);
           }
 
-          const branch = (
-            process.env.GITHUB_BRANCH ||
-            branchResult.stdout.trim() ||
-            'main'
-          ).trim();
-
-          const fetchResult = runGit(['fetch', 'origin', branch]);
-
-          if (fetchResult.status !== 0) {
-            throw new Error(
-              fetchResult.stderr || 'Could not fetch updates from GitHub.'
-            );
+          if (!result.updated) {
+            return interaction.editReply('KatBot is already up to date.');
           }
 
-          const localResult = runGit(['rev-parse', 'HEAD']);
-          const remoteResult = runGit(['rev-parse', `origin/${branch}`]);
-
-          if (localResult.status !== 0 || remoteResult.status !== 0) {
-            throw new Error(
-              'Could not read the local or remote Git revision. Check that the repository has a commit.'
-            );
+          if (result.message.includes('npm ci failed')) {
+            return interaction.editReply(result.message);
           }
 
-          const local = localResult.stdout.trim();
-          const remote = remoteResult.stdout.trim();
-
-          if (local === remote) {
-            return interaction.editReply(
-              'KatBot is already up to date.'
-            );
-          }
-
-          const ancestorResult = runGit([
-            'merge-base',
-            '--is-ancestor',
-            'HEAD',
-            `origin/${branch}`,
-          ]);
-
-          if (ancestorResult.status !== 0) {
-            throw new Error(
-              'The local version cannot be safely updated with a fast-forward. No update was applied.'
-            );
-          }
-
-          const changedResult = runGit([
-            'diff',
-            '--name-only',
-            'HEAD',
-            `origin/${branch}`,
-          ]);
-
-          if (changedResult.status !== 0) {
-            throw new Error('Could not determine which files will change.');
-          }
-
-          const packageChanged = changedResult.stdout
-            .split(/\r?\n/)
-            .some((file) =>
-              ['package.json', 'package-lock.json'].includes(file.trim())
-            );
-
-          const updateResult = runGit([
-            'merge',
-            '--ff-only',
-            `origin/${branch}`,
-          ]);
-
-          if (updateResult.status !== 0) {
-            throw new Error(
-              updateResult.stderr ||
-              'Git could not safely apply the update. Check for local changes.'
-            );
-          }
-
-          if (packageChanged) {
-            const installResult = spawnSync('npm', ['ci'], {
-              cwd: __dirname,
-              encoding: 'utf8',
-              timeout: 180000,
-              maxBuffer: 4 * 1024 * 1024,
-            });
-
-            if (installResult.status !== 0) {
-              console.error('npm ci failed:', installResult.stderr);
-
-              return interaction.editReply(
-                'The code was updated, but dependency installation failed. KatBot has not been intentionally stopped. Check the Termux output before restarting.'
-              );
-            }
-          }
-
-          return interaction.editReply(
-            `GitHub update downloaded successfully (${local.slice(0, 7)} → ${remote.slice(0, 7)}).\n\n` +
-            'KatBot is still running on its current code. To apply the update, restart it from Termux: press Ctrl+C, then run `node index.js` again.'
+          await interaction.editReply(
+            `${result.message}\nRestarting KatBot now. It may be offline briefly.`
           );
+
+          setTimeout(restartBot, 1500);
         } catch (error) {
           console.error('Error during /update:', error);
-
           return interaction.editReply(
-            `Update failed. KatBot has not been intentionally stopped.\n${String(error.message || error).slice(0, 1200)}`
+            `Update failed: ${String(error.message || error).slice(0, 1000)}`
           );
         }
+
+        return;
       }
 
       if (name === 'setup') {
-        if (
-          !interaction.memberPermissions?.has(
-            PermissionFlagsBits.ManageGuild
-          )
-        ) {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
           return interaction.reply({
             content: 'Only members with Manage Server permission can configure KatBot.',
             ephemeral: true,
@@ -783,11 +813,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      if (
-        !interaction.memberPermissions?.has(
-          PermissionFlagsBits.ManageGuild
-        )
-      ) {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
         return interaction.reply({
           content: 'You do not have permission to configure KatBot.',
           ephemeral: true,
@@ -802,31 +828,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (id === 'setup_welcome') {
-        return interaction.reply({
-          ...welcomePanel(guildId),
-          ephemeral: true,
-        });
+        return interaction.reply({ ...welcomePanel(guildId), ephemeral: true });
       }
 
       if (id === 'setup_statuses') {
-        return interaction.reply({
-          ...statusesPanel(guildId),
-          ephemeral: true,
-        });
+        return interaction.reply({ ...statusesPanel(guildId), ephemeral: true });
       }
 
       if (id === 'setup_commands') {
-        return interaction.reply({
-          ...commandsPanel(guildId),
-          ephemeral: true,
-        });
+        return interaction.reply({ ...commandsPanel(guildId), ephemeral: true });
       }
 
       if (id === 'welcome_toggle') {
         const config = getSettings(guildId);
         config.welcomeEnabled = !config.welcomeEnabled;
         saveData();
-
         return interaction.update(welcomePanel(guildId));
       }
 
@@ -845,17 +861,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(1900)
           .setValue(config.welcomeMessage);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(input)
-        );
-
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
       }
 
       if (id === 'status_add') {
-        return interaction.showModal(
-          statusModal('status_add_modal', 'Add Activity')
-        );
+        return interaction.showModal(statusModal('status_add_modal', 'Add Activity'));
       }
 
       if (id === 'status_interval_edit') {
@@ -873,10 +884,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(4)
           .setValue(String(config.statusInterval));
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(input)
-        );
-
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
       }
 
@@ -897,9 +905,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (id === 'custom_add') {
-        return interaction.showModal(
-          customCommandModal('custom_add_modal', 'Create Command')
-        );
+        return interaction.showModal(customCommandModal('custom_add_modal', 'Create Command'));
       }
 
       if (id === 'custom_edit_select') {
@@ -920,11 +926,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isStringSelectMenu()) {
-      if (
-        !interaction.memberPermissions?.has(
-          PermissionFlagsBits.ManageGuild
-        )
-      ) {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
         return interaction.reply({
           content: 'You do not have permission to configure KatBot.',
           ephemeral: true,
@@ -961,14 +963,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const config = getSettings(guildId);
 
         if (!config.statuses[index]) {
-          return interaction.reply({
-            content: 'Activity not found.',
-            ephemeral: true,
-          });
+          return interaction.reply({ content: 'Activity not found.', ephemeral: true });
         }
 
         const removed = config.statuses.splice(index, 1)[0];
-
         saveData();
         refreshStatusNow();
 
@@ -983,10 +981,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const response = getSettings(guildId).customCommands[name];
 
         if (typeof response !== 'string') {
-          return interaction.reply({
-            content: 'Command not found.',
-            ephemeral: true,
-          });
+          return interaction.reply({ content: 'Command not found.', ephemeral: true });
         }
 
         return interaction.showModal(
@@ -999,14 +994,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const config = getSettings(guildId);
 
         if (!(name in config.customCommands)) {
-          return interaction.reply({
-            content: 'Command not found.',
-            ephemeral: true,
-          });
+          return interaction.reply({ content: 'Command not found.', ephemeral: true });
         }
 
         delete config.customCommands[name];
-
         saveData();
         await queueGuildCommandSync(guildId);
 
@@ -1025,11 +1016,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      if (
-        !interaction.memberPermissions?.has(
-          PermissionFlagsBits.ManageGuild
-        )
-      ) {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
         return interaction.reply({
           content: 'You do not have permission to configure KatBot.',
           ephemeral: true,
@@ -1058,11 +1045,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           interaction.fields.getTextInputValue('interval_seconds')
         );
 
-        if (
-          !Number.isInteger(seconds) ||
-          seconds < 30 ||
-          seconds > 3600
-        ) {
+        if (!Number.isInteger(seconds) || seconds < 30 || seconds > 3600) {
           return interaction.reply({
             content: 'Enter a whole number from 30 to 3600.',
             ephemeral: true,
@@ -1070,7 +1053,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         config.statusInterval = seconds;
-
         saveData();
         refreshStatusNow();
 
@@ -1080,10 +1062,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      if (
-        id === 'status_add_modal' ||
-        id.startsWith('status_edit_modal:')
-      ) {
+      if (id === 'status_add_modal' || id.startsWith('status_edit_modal:')) {
         const type = interaction.fields
           .getTextInputValue('activity_type')
           .trim()
@@ -1131,25 +1110,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      if (
-        id === 'custom_add_modal' ||
-        id.startsWith('custom_edit_modal:')
-      ) {
-        const rawName = interaction.fields
-          .getTextInputValue('command_name');
-
+      if (id === 'custom_add_modal' || id.startsWith('custom_edit_modal:')) {
+        const rawName = interaction.fields.getTextInputValue('command_name');
         const name = cleanCommandName(rawName);
-
         const response = interaction.fields
           .getTextInputValue('command_response')
           .trim();
 
-        if (
-          !isValidCommandName(name) ||
-          rawName.trim().toLowerCase() !== name
-        ) {
+        if (!isValidCommandName(name) || rawName.trim().toLowerCase() !== name) {
           return interaction.reply({
-            content: 'Invalid name. Use only lowercase letters, numbers, hyphens, or underscores; 1–32 characters. /setup, /ping, and /update are reserved.',
+            content: 'Invalid name. Use lowercase letters, numbers, hyphens, or underscores; 1–32 characters. /setup, /ping, and /update are reserved.',
             ephemeral: true,
           });
         }
@@ -1181,10 +1151,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
         }
 
-        if (
-          !exists &&
-          Object.keys(config.customCommands).length >= 100
-        ) {
+        if (!exists && Object.keys(config.customCommands).length >= 100) {
           return interaction.reply({
             content: 'You have reached the limit of 100 custom commands for this server.',
             ephemeral: true,
@@ -1196,7 +1163,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         config.customCommands[name] = response;
-
         saveData();
         await queueGuildCommandSync(guildId);
 
@@ -1209,11 +1175,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   } catch (error) {
     console.error('Error handling interaction:', error);
 
-    if (
-      interaction.isRepliable() &&
-      !interaction.replied &&
-      !interaction.deferred
-    ) {
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({
         content: 'An error occurred. Check the terminal for details.',
         ephemeral: true,
@@ -1222,4 +1184,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+/* -------------------- STARTUP -------------------- */
+
+async function startBot() {
+  if (process.env.AUTO_UPDATE !== 'false') {
+    console.log('Checking GitHub for updates...');
+
+    try {
+      const result = updateFromGitHub();
+      console.log(result.message);
+
+      if (!result.ok) {
+        console.error('Starting with the local version.');
+      }
+    } catch (error) {
+      console.error('Startup update failed:', error.message);
+      console.log('Starting with the local version.');
+    }
+  }
+
+  await client.login(process.env.DISCORD_TOKEN);
+}
+
+startBot().catch((error) => {
+  console.error('Could not start KatBot:', error);
+  process.exit(1);
+});
