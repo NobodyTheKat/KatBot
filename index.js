@@ -1359,9 +1359,14 @@ client.on(Events.InteractionCreate, async interaction => {
           .getTextInputValue('command_message')
           .trim();
 
-        if (!isValidCommandName(name) || rawName.trim() !== name) {
+        // THE ONLY CHANGE: compare the trimmed input in lowercase,
+        // so uppercase command names are accepted and saved in lowercase.
+        if (
+          !isValidCommandName(name) ||
+          rawName.trim().toLowerCase() !== name
+        ) {
           return interaction.reply({
-            content: 'Use lowercase letters, numbers, hyphens or underscores. /setup and /ping are reserved.',
+            content: 'Use letters, numbers, hyphens or underscores. /setup and /ping are reserved.',
             flags: MessageFlags.Ephemeral,
           });
         }
