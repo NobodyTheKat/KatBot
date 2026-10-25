@@ -1,8 +1,11 @@
+
 require('dotenv').config();
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+
+// ---------- Automatic GitHub updater ----------
 
 if (
   process.env.KATBOT_UPDATE_CHECKED !== '1' &&
@@ -29,26 +32,25 @@ if (
     const remote = git(['rev-parse', `origin/${branch}`]).stdout.trim();
 
     if (local && remote && local !== remote) {
-      const changed = git([
+      const diff = git([
         'diff', '--name-only', 'HEAD', `origin/${branch}`,
       ]);
 
-      if (changed.status !== 0) {
-        throw new Error(changed.stderr || 'Could not inspect update');
+      if (diff.status !== 0) {
+        throw new Error(diff.stderr || 'Could not inspect update');
       }
 
-      const packageChanged = changed.stdout
+      const packageChanged = diff.stdout
         .split(/\r?\n/)
-        .some(file => [
-          'package.json',
-          'package-lock.json',
-        ].includes(file));
+        .some(file =>
+          ['package.json', 'package-lock.json'].includes(file)
+        );
 
-      const pull = git(['merge', '--ff-only', `origin/${branch}`]);
+      const update = git(['merge', '--ff-only', `origin/${branch}`]);
 
-      if (pull.status !== 0) {
+      if (update.status !== 0) {
         throw new Error(
-          pull.stderr || 'Update refused; local changes may exist'
+          update.stderr || 'Update refused because local changes exist'
         );
       }
 
@@ -86,6 +88,8 @@ if (
   }
 }
 
+// ---------- Discord ----------
+
 const {
   Client,
   GatewayIntentBits,
@@ -117,6 +121,11 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
   ],
 });
+
+const rest = new REST({ version: '10' })
+  .setToken(process.env.DISCORD_TOKEN);
+
+// ---------- Storage ----------
 
 const dataDir = path.join(__dirname, 'data');
 const dataFile = path.join(dataDir, 'settings.json');
@@ -155,10 +164,7 @@ function getSettings(guildId) {
     settings[guildId] = {
       welcomeEnabled: true,
       welcomeMessage: 'Welcome {user} to {server}!',
-      statuses: [
-        { type: 'watching', text: 'the community' },
-        { type: 'playing', text: 'Minecraft' },
-      ],
+      statuses: [],
       statusInterval: 60,
       customCommands: {},
     };
@@ -173,24 +179,26 @@ function getSettings(guildId) {
   }
 
   if (typeof config.welcomeMessage !== 'string') {
-    config.welcomeMessage = 'Welcome {user} to {server}!';
+    config.welcomeMessage = '';
   }
 
   if (!Array.isArray(config.statuses)) config.statuses = [];
+
   if (!Number.isInteger(config.statusInterval)) {
     config.statusInterval = 60;
   }
 
   if (
     !config.customCommands ||
-    typeof config.customCommands !== 'object' ||
-    Array.isArray(config.customCommands)
+    typeof config.customCommands !== 'object'
   ) {
     config.customCommands = {};
   }
 
   return config;
 }
+
+// ---------- Choices ----------
 
 const activityTypes = {
   playing: ActivityType.Playing,
@@ -207,6 +215,7 @@ const activityLabels = {
 };
 
 const embedPresets = {
+  none: { label: 'No color', color: null },
   blurple: { label: 'Discord Blurple', color: '#5865F2' },
   red: { label: 'Red', color: '#ED4245' },
   orange: { label: 'Orange', color: '#F97316' },
@@ -217,11 +226,7 @@ const embedPresets = {
   purple: { label: 'Purple', color: '#9B59B6' },
   pink: { label: 'Pink', color: '#EB459E' },
   dark: { label: 'Dark', color: '#232428' },
-  none: { label: 'No embed color', color: null },
 };
-
-const rest = new REST({ version: '10' })
-  .setToken(process.env.DISCORD_TOKEN);
 
 const baseCommands = [
   new SlashCommandBuilder()
@@ -238,14 +243,142 @@ let statusTimer = null;
 let statusIndex = 0;
 let syncingGuilds = Promise.resolve();
 
+// ---------- Placeholders ----------
+
+const placeholderHelp =
+  '**Message placeholders**\n\n' +
+  '`{user}` — username\n' +
+  '`{user.mention}` — mention the user\n' +
+  '`{user.id}` — user ID\n' +
+  '`{user.tag}` — user tag\n' +
+  '`{username}` — username\n' +
+  '`{server}` — server name\n' +
+  '`{server.id}` — server ID\n' +
+  '`{server.members}` — number of members\n' +
+  '`{server.owner}` — server owner\n' +
+  '`{channel}` — channel name\n' +
+  '`{channel.mention}` — channel mention\n' +
+  '`{date}` — current date\n' +
+  '`{time}` — current time\n' +
+  '`{timestamp}` — Unix timestamp\n' +
+  '`{bot}` — bot name\n\n' +
+  'You can write these directly in your message. ' +
+  'KatBot replaces them automatically when the command is used.';
+
+function replacePlaceholders(text, context) {
+  const guild = context.guild || null;
+  const user = context.user || null;
+  const channel = context.channel || null;
+  const now = new Date();
+
+  const replacements = {
+    '{user}': user?.username || '',
+    '{user.mention}': user ? `<@${user.id}>` : '',
+    '{user.id}': user?.id || '',
+    '{user.tag}': user?.tag || user?.username || '',
+    '{username}': user?.username || '',
+    '{server}': guild?.name || 'Direct Message',
+    '{server.id}': guild?.id || '',
+    '{server.members}': String(guild?.memberCount ?? 0),
+    '{server.owner}': guild?.ownerId
+      ? `<@${guild.ownerId}>`
+      : 'Unknown',
+    '{channel}': channel?.name || 'Unknown',
+    '{channel.mention}': channel?.id ? `<#${channel.id}>` : '',
+    '{date}': now.toLocaleDateString('en-GB'),
+    '{time}': now.toLocaleTimeString('en-GB', { hour12: false }),
+    '{timestamp}': String(Math.floor(now.getTime() / 1000)),
+    '{bot}': client.user?.username || 'KatBot',
+  };
+
+  return String(text || '').replace(
+    /\{user\.mention\}|\{user\.id\}|\{user\.tag\}|\{server\.members\}|\{server\.owner\}|\{server\.id\}|\{channel\.mention\}|\{timestamp\}|\{username\}|\{server\}|\{channel\}|\{user\}|\{date\}|\{time\}|\{bot\}/g,
+    match => replacements[match] ?? match
+  );
+}
+
+// ---------- Custom command data ----------
+
+function getStoredCommandData(response) {
+  if (typeof response !== 'string') {
+    return { content: '', color: null };
+  }
+
+  try {
+    const parsed = JSON.parse(response);
+
+    // Support older saved commands.
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const embed = parsed.embed || {};
+
+      return {
+        content: typeof parsed.content === 'string'
+          ? parsed.content
+          : typeof embed.description === 'string'
+            ? embed.description
+            : '',
+        color: embed.color ?? null,
+      };
+    }
+  } catch {
+    // Old commands may contain plain text.
+  }
+
+  return { content: response, color: null };
+}
+
+function normalizeEmbedColor(color) {
+  if (typeof color !== 'string') return null;
+
+  if (!/^#?[0-9a-f]{6}$/i.test(color)) return null;
+
+  return parseInt(color.replace('#', ''), 16);
+}
+
+function renderCustomResponse(response, interaction) {
+  const data = getStoredCommandData(response);
+  const message = replacePlaceholders(data.content, interaction).trim();
+
+  const payload = {
+    allowedMentions: {
+      parse: [],
+      users: [],
+      roles: [],
+      repliedUser: false,
+    },
+  };
+
+  if (message) payload.content = message.slice(0, 2000);
+
+  // A colored embed is used when a color was selected.
+  // The message itself stays ordinary text.
+  const color = normalizeEmbedColor(data.color);
+
+  if (color !== null && message) {
+    payload.embeds = [
+      new EmbedBuilder()
+        .setColor(color)
+        .setDescription(message.slice(0, 4096)),
+    ];
+
+    delete payload.content;
+  }
+
+  if (!payload.content && !payload.embeds) {
+    payload.content = 'This command has no message configured.';
+  }
+
+  return payload;
+}
+
+// ---------- Status rotation ----------
+
 function allConfiguredStatuses() {
-  return [
-    ...new Map(
-      Object.values(settings)
-        .flatMap(server => server.statuses || [])
-        .map(item => [`${item.type}:${item.text}`, item])
-    ).values(),
-  ];
+  return [...new Map(
+    Object.values(settings)
+      .flatMap(server => server.statuses || [])
+      .map(item => [`${item.type}:${item.text}`, item])
+  ).values()];
 }
 
 function rotateStatus() {
@@ -254,7 +387,8 @@ function rotateStatus() {
   const statuses = allConfiguredStatuses();
 
   if (!statuses.length) {
-    client.user.setActivity('KatBot', {
+    client.user.setActivity({
+      name: 'KatBot setup',
       type: ActivityType.Playing,
     });
   } else {
@@ -283,9 +417,10 @@ function refreshStatusNow() {
   rotateStatus();
 }
 
+// ---------- Slash command synchronization ----------
+
 function cleanCommandName(input) {
-  return input.toLowerCase()
-    .trim()
+  return input.toLowerCase().trim()
     .replace(/[^a-z0-9_-]/g, '')
     .slice(0, 32);
 }
@@ -296,21 +431,23 @@ function isValidCommandName(name) {
 }
 
 async function syncGuildCustomCommands(guildId) {
-  const commands = Object.entries(getSettings(guildId).customCommands)
+  const commands = Object.entries(
+    getSettings(guildId).customCommands
+  )
     .filter(([name, response]) =>
       isValidCommandName(name) && typeof response === 'string'
     )
     .slice(0, 100)
-    .map(([name]) =>
-      new SlashCommandBuilder()
-        .setName(name)
-        .setDescription(`KatBot custom command: ${name}`.slice(0, 100))
-        .toJSON()
-    );
+    .map(([name]) => new SlashCommandBuilder()
+      .setName(name)
+      .setDescription(`KatBot custom command: ${name}`.slice(0, 100))
+      .toJSON());
 
   await rest.put(
     Routes.applicationGuildCommands(client.user.id, guildId),
-    { body: commands }
+    { body: [...baseCommands.map(command => command.toJSON())
+      .filter(command => command.name !== 'setup' && command.name !== 'ping'),
+      ...commands] }
   );
 }
 
@@ -328,14 +465,14 @@ async function syncAllGuildCustomCommands() {
   }
 }
 
+// ---------- Setup panel ----------
+
 function panelEmbed(title, description) {
   return new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle(title)
     .setDescription(description)
-    .setFooter({
-      text: 'KatBot • Changes are saved automatically',
-    });
+    .setFooter({ text: 'KatBot • Changes are saved automatically' });
 }
 
 function mainPanelRows() {
@@ -345,23 +482,14 @@ function mainPanelRows() {
         .setCustomId('setup_welcome')
         .setLabel('Welcome')
         .setStyle(ButtonStyle.Primary),
-
       new ButtonBuilder()
         .setCustomId('setup_statuses')
         .setLabel('Bot Statuses')
         .setStyle(ButtonStyle.Primary),
-
       new ButtonBuilder()
         .setCustomId('setup_commands')
         .setLabel('Custom Commands')
-        .setStyle(ButtonStyle.Primary)
-    ),
-
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('setup_refresh')
-        .setLabel('Refresh Panel')
-        .setStyle(ButtonStyle.Secondary)
+        .setStyle(ButtonStyle.Primary),
     ),
   ];
 }
@@ -370,37 +498,30 @@ function welcomePanel(guildId) {
   const config = getSettings(guildId);
 
   return {
-    embeds: [
-      panelEmbed(
-        'Welcome Settings',
-        `**Welcome DMs:** ${config.welcomeEnabled ? 'Enabled' : 'Disabled'}\n` +
-        `**Current message:**\n${config.welcomeMessage}\n\n` +
-        'Available placeholders: `{user}`, `{server}`, `{bot}`, `{date}`, `{time}`.'
-      ),
-    ],
-
+    embeds: [panelEmbed(
+      'Welcome Settings',
+      `**Welcome DMs:** ${config.welcomeEnabled ? 'Enabled' : 'Disabled'}\n` +
+      `**Current message:**\n${config.welcomeMessage || '(empty)'}\n\n` +
+      'Placeholders: `{user}`, `{server}`.'
+    )],
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('welcome_toggle')
           .setLabel(config.welcomeEnabled ? 'Disable DMs' : 'Enable DMs')
-          .setStyle(
-            config.welcomeEnabled
-              ? ButtonStyle.Danger
-              : ButtonStyle.Success
-          ),
-
+          .setStyle(config.welcomeEnabled
+            ? ButtonStyle.Danger
+            : ButtonStyle.Success),
         new ButtonBuilder()
           .setCustomId('welcome_edit')
           .setLabel('Edit Message')
-          .setStyle(ButtonStyle.Primary)
+          .setStyle(ButtonStyle.Primary),
       ),
-
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('setup_home')
           .setLabel('Back to Panel')
-          .setStyle(ButtonStyle.Secondary)
+          .setStyle(ButtonStyle.Secondary),
       ),
     ],
   };
@@ -416,178 +537,50 @@ function statusesPanel(guildId) {
     : 'No activities have been added.';
 
   return {
-    embeds: [
-      panelEmbed(
-        'Bot Statuses',
-        `${list}\n\n**Rotation interval:** ${config.statusInterval} seconds`
-      ),
-    ],
-
+    embeds: [panelEmbed(
+      'Bot Statuses',
+      `${list}\n\n**Rotation interval:** ${config.statusInterval} seconds`
+    )],
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('status_add')
           .setLabel('Add Activity')
           .setStyle(ButtonStyle.Success),
-
         new ButtonBuilder()
           .setCustomId('status_edit_select')
           .setLabel('Edit Activity')
           .setStyle(ButtonStyle.Primary)
           .setDisabled(config.statuses.length === 0),
-
         new ButtonBuilder()
           .setCustomId('status_delete_select')
           .setLabel('Delete Activity')
           .setStyle(ButtonStyle.Danger)
-          .setDisabled(config.statuses.length === 0)
+          .setDisabled(config.statuses.length === 0),
       ),
-
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('status_interval_edit')
           .setLabel('Change Interval')
           .setStyle(ButtonStyle.Secondary),
-
         new ButtonBuilder()
           .setCustomId('setup_home')
           .setLabel('Back to Panel')
-          .setStyle(ButtonStyle.Secondary)
+          .setStyle(ButtonStyle.Secondary),
       ),
     ],
   };
 }
 
-function getStoredCommandData(response) {
-  try {
-    const parsed = JSON.parse(response);
-
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      !Array.isArray(parsed)
-    ) {
-      return {
-        message: typeof parsed.message === 'string'
-          ? parsed.message
-          : typeof parsed.content === 'string'
-            ? parsed.content
-            : '',
-
-        color: parsed.color ?? null,
-
-        visibility: parsed.visibility === 'private'
-          ? 'private'
-          : 'public',
-      };
-    }
-  } catch {}
-
-  // Support commands saved by older versions.
-  return {
-    message: typeof response === 'string' ? response : '',
-    color: null,
-    visibility: 'public',
-  };
-}
-
-function replacePlaceholders(text, context) {
-  const guild = context.guild;
-  const user = context.user;
-  const channel = context.channel;
-  const now = new Date();
-
-  const replacements = {
-    '{user}': user?.username || 'Unknown user',
-    '{user.mention}': user ? `<@${user.id}>` : '',
-    '{user.id}': user?.id || '',
-    '{user.tag}': user?.tag || user?.username || 'Unknown user',
-    '{username}': user?.username || 'Unknown user',
-    '{server}': guild?.name || 'Direct Message',
-    '{server.id}': guild?.id || '',
-    '{server.members}': String(guild?.memberCount ?? 0),
-    '{server.owner}': guild?.ownerId ? `<@${guild.ownerId}>` : 'Unknown',
-    '{channel}': channel?.name || 'Unknown',
-    '{channel.mention}': channel?.id ? `<#${channel.id}>` : '',
-    '{date}': now.toLocaleDateString('en-GB'),
-    '{time}': now.toLocaleTimeString('en-GB', { hour12: false }),
-    '{timestamp}': String(Math.floor(now.getTime() / 1000)),
-    '{bot}': client.user?.username || 'KatBot',
-  };
-
-  return String(text || '').replace(
-    /\{user\.mention\}|\{user\.id\}|\{user\.tag\}|\{server\.members\}|\{server\.owner\}|\{server\.id\}|\{channel\.mention\}|\{timestamp\}|\{username\}|\{server\}|\{channel\}|\{user\}|\{time\}|\{date\}|\{bot\}/g,
-    match => replacements[match] ?? match
-  );
-}
-
-function normalizeEmbedColor(color) {
-  if (typeof color === 'string') {
-    if (!/^#?[0-9a-f]{6}$/i.test(color)) return null;
-
-    return parseInt(color.replace('#', ''), 16);
-  }
-
-  if (
-    Number.isInteger(color) &&
-    color >= 0 &&
-    color <= 0xFFFFFF
-  ) {
-    return color;
-  }
-
-  return null;
-}
-
-function renderCustomResponse(response, interaction) {
-  const data = getStoredCommandData(response);
-
-  const message = replacePlaceholders(
-    data.message,
-    interaction
-  ).trim();
-
-  const payload = {};
-
-  if (message) {
-    payload.embeds = [
-      new EmbedBuilder()
-        .setDescription(message.slice(0, 4096)),
-    ];
-
-    const color = normalizeEmbedColor(data.color);
-
-    if (color !== null) {
-      payload.embeds[0].setColor(color);
-    }
-  } else {
-    payload.content = 'This command has no message configured.';
-  }
-
-  payload.allowedMentions = {
-    parse: [],
-    users: [],
-    roles: [],
-    repliedUser: false,
-  };
-
-  return {
-    payload,
-    visibility: data.visibility,
-  };
-}
-
 function commandsPanel(guildId) {
-  const entries = Object.entries(
-    getSettings(guildId).customCommands
-  );
+  const entries = Object.entries(getSettings(guildId).customCommands);
 
   const list = entries.length
     ? entries.map(([name, response]) => {
       const data = getStoredCommandData(response);
-      const preview = data.message || '(empty message)';
+      const preview = data.content || '(empty message)';
 
-      return `**/${name}** · ${data.visibility === 'private' ? 'Private' : 'Public'} · ${preview.slice(0, 55)}`;
+      return `**/${name}** · ${String(preview).slice(0, 60)}`;
     }).join('\n')
     : 'No custom commands have been created yet.';
 
@@ -595,39 +588,38 @@ function commandsPanel(guildId) {
     embeds: [
       panelEmbed(
         'Custom Commands',
-        `${list}\n\nCreate, edit or delete slash commands. Changes are saved automatically.`
+        `${list}\n\nCreate, edit or delete commands. Changes are saved automatically.`
       ),
+      panelEmbed('Placeholder Reminder', placeholderHelp),
     ],
-
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('custom_add')
           .setLabel('Create Command')
           .setStyle(ButtonStyle.Success),
-
         new ButtonBuilder()
           .setCustomId('custom_edit_select')
           .setLabel('Edit Command')
           .setStyle(ButtonStyle.Primary)
           .setDisabled(entries.length === 0),
-
         new ButtonBuilder()
           .setCustomId('custom_delete_select')
           .setLabel('Delete Command')
           .setStyle(ButtonStyle.Danger)
-          .setDisabled(entries.length === 0)
+          .setDisabled(entries.length === 0),
       ),
-
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId('setup_home')
           .setLabel('Back to Panel')
-          .setStyle(ButtonStyle.Secondary)
+          .setStyle(ButtonStyle.Secondary),
       ),
     ],
   };
 }
+
+// ---------- Select menus ----------
 
 function statusSelectRow(guildId, customId) {
   const statuses = getSettings(guildId).statuses;
@@ -636,15 +628,11 @@ function statusSelectRow(guildId, customId) {
     new StringSelectMenuBuilder()
       .setCustomId(customId)
       .setPlaceholder('Choose an activity')
-      .addOptions(
-        statuses.slice(0, 25).map((status, index) => ({
-          label: `${index + 1}. ${status.text}`.slice(0, 100),
-          description: (
-            activityLabels[status.type] || status.type
-          ).slice(0, 100),
-          value: String(index),
-        }))
-      )
+      .addOptions(statuses.slice(0, 25).map((status, index) => ({
+        label: `${index + 1}. ${status.text}`.slice(0, 100),
+        description: (activityLabels[status.type] || status.type).slice(0, 100),
+        value: String(index),
+      })))
   );
 }
 
@@ -657,59 +645,29 @@ function commandSelectRow(guildId, customId) {
     new StringSelectMenuBuilder()
       .setCustomId(customId)
       .setPlaceholder('Choose a command')
-      .addOptions(
-        commands.map(([name]) => ({
-          label: `/${name}`.slice(0, 100),
-          value: name,
-        }))
-      )
+      .addOptions(commands.map(([name]) => ({
+        label: `/${name}`.slice(0, 100),
+        value: name,
+      })))
   );
 }
 
 function presetSelectRow(customId, currentColor = null) {
-  const selected = Object.entries(embedPresets).find(
-    ([, preset]) =>
-      preset.color &&
-      preset.color.toLowerCase() ===
-        String(currentColor || '').toLowerCase()
-  )?.[0] || (currentColor === null ? 'blurple' : 'none');
-
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(customId)
       .setPlaceholder('Choose an embed color')
-      .addOptions(
-        Object.entries(embedPresets).map(([value, preset]) => ({
-          label: preset.label,
-          value,
-          description: preset.color || 'No color',
-          default: value === selected,
-        }))
-      )
+      .addOptions(Object.entries(embedPresets).map(([value, preset]) => ({
+        label: preset.label,
+        value,
+        description: preset.color || 'No color',
+        default: preset.color === currentColor ||
+          (value === 'none' && currentColor == null),
+      })))
   );
 }
 
-function visibilitySelectRow(customId, currentVisibility = 'public') {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(customId)
-      .setPlaceholder('Choose response visibility')
-      .addOptions([
-        {
-          label: 'Public response',
-          description: 'Everyone in the channel can see it.',
-          value: 'public',
-          default: currentVisibility !== 'private',
-        },
-        {
-          label: 'Private response',
-          description: 'Only you can see the response.',
-          value: 'private',
-          default: currentVisibility === 'private',
-        },
-      ])
-  );
-}
+// ---------- Modals ----------
 
 function statusModal(customId, title, status = null) {
   const modal = new ModalBuilder()
@@ -721,29 +679,28 @@ function statusModal(customId, title, status = null) {
     .setLabel('playing, watching, listening, competing')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
-    .setMaxLength(20)
-    .setValue(status?.type || 'watching');
+    .setMaxLength(20);
+
+  if (status?.type) typeInput.setValue(status.type);
 
   const textInput = new TextInputBuilder()
     .setCustomId('activity_text')
     .setLabel('Activity text')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
-    .setMaxLength(128)
-    .setValue(status?.text || '');
+    .setMaxLength(128);
+
+  if (status?.text) textInput.setValue(status.text);
 
   return modal.addComponents(
     new ActionRowBuilder().addComponents(typeInput),
-    new ActionRowBuilder().addComponents(textInput)
+    new ActionRowBuilder().addComponents(textInput),
   );
 }
 
-function customCommandModal(
-  customId,
-  title,
-  name = '',
-  message = ''
-) {
+function customCommandModal(customId, title, name = '', response = '') {
+  const previous = getStoredCommandData(response);
+
   const modal = new ModalBuilder()
     .setCustomId(customId)
     .setTitle(title);
@@ -759,46 +716,26 @@ function customCommandModal(
 
   const messageInput = new TextInputBuilder()
     .setCustomId('command_message')
-    .setLabel('Message (placeholders listed below)')
-    .setPlaceholder(
-      'Example: Hello {user.mention}, welcome to {server}!'
-    )
+    .setLabel('Message')
+    .setPlaceholder('Write your message here...')
     .setStyle(TextInputStyle.Paragraph)
-    .setRequired(true)
+    .setRequired(false)
     .setMaxLength(4000);
 
-  if (message) messageInput.setValue(message);
+  if (previous.content) messageInput.setValue(previous.content);
 
-  const reminder = new TextInputBuilder()
-    .setCustomId('placeholder_reminder')
-    .setLabel('PLACEHOLDER REMINDER — read this')
-    .setPlaceholder(
-      '{user}, {user.mention}, {user.id}, {username}, {server}, {server.members}, {server.owner}, {channel}, {channel.mention}, {date}, {time}, {timestamp}, {bot}'
-    )
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setMaxLength(100);
-
-  // The reminder field is optional and read-only in purpose:
-  // users can see the placeholder list without needing to memorize it.
-  // Discord does not support truly read-only modal fields.
-  modal.addComponents(
+  return modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
     new ActionRowBuilder().addComponents(messageInput),
-    new ActionRowBuilder().addComponents(reminder)
   );
-
-  return modal;
 }
 
 async function showHome(interaction, update = false) {
   const payload = {
-    embeds: [
-      panelEmbed(
-        'KatBot • Setup',
-        'Choose a section to configure. Changes are saved automatically and applied without restarting KatBot.'
-      ),
-    ],
+    embeds: [panelEmbed(
+      'KatBot • Setup',
+      'Choose a section to configure. Changes are saved automatically and applied without restarting KatBot.'
+    )],
     components: mainPanelRows(),
   };
 
@@ -810,16 +747,15 @@ async function showHome(interaction, update = false) {
     });
 }
 
+// ---------- Events ----------
+
 client.once(Events.ClientReady, async readyClient => {
   console.log(`KatBot online as ${readyClient.user.tag}`);
 
   try {
-    await rest.put(
-      Routes.applicationCommands(readyClient.user.id),
-      {
-        body: baseCommands.map(command => command.toJSON()),
-      }
-    );
+    await rest.put(Routes.applicationCommands(readyClient.user.id), {
+      body: baseCommands.map(command => command.toJSON()),
+    });
 
     await syncAllGuildCustomCommands();
 
@@ -840,7 +776,7 @@ client.on(Events.GuildCreate, async guild => {
 client.on(Events.GuildMemberAdd, async member => {
   const config = getSettings(member.guild.id);
 
-  if (!config.welcomeEnabled) return;
+  if (!config.welcomeEnabled || !config.welcomeMessage) return;
 
   const message = replacePlaceholders(config.welcomeMessage, {
     guild: member.guild,
@@ -849,7 +785,10 @@ client.on(Events.GuildMemberAdd, async member => {
   });
 
   try {
-    await member.send(message);
+    await member.send({
+      content: message.slice(0, 2000),
+      allowedMentions: { parse: [] },
+    });
   } catch {
     console.log(`Could not DM ${member.user.tag}.`);
   }
@@ -857,6 +796,8 @@ client.on(Events.GuildMemberAdd, async member => {
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
+    // ---------- Slash commands ----------
+
     if (interaction.isChatInputCommand()) {
       const name = interaction.commandName;
 
@@ -875,11 +816,9 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (name === 'setup') {
-        if (
-          !interaction.memberPermissions?.has(
-            PermissionFlagsBits.ManageGuild
-          )
-        ) {
+        if (!interaction.memberPermissions?.has(
+          PermissionFlagsBits.ManageGuild
+        )) {
           return interaction.reply({
             content: 'You need Manage Server permission to configure KatBot.',
             flags: MessageFlags.Ephemeral,
@@ -894,21 +833,13 @@ client.on(Events.InteractionCreate, async interaction => {
       ).customCommands[name];
 
       if (typeof response === 'string') {
-        const rendered = renderCustomResponse(
-          response,
-          interaction
-        );
-
-        return interaction.reply({
-          ...rendered.payload,
-          flags: rendered.visibility === 'private'
-            ? MessageFlags.Ephemeral
-            : undefined,
-        });
+        return interaction.reply(renderCustomResponse(response, interaction));
       }
 
       return;
     }
+
+    // ---------- Buttons ----------
 
     if (interaction.isButton()) {
       if (!interaction.guildId) {
@@ -918,11 +849,9 @@ client.on(Events.InteractionCreate, async interaction => {
         });
       }
 
-      if (
-        !interaction.memberPermissions?.has(
-          PermissionFlagsBits.ManageGuild
-        )
-      ) {
+      if (!interaction.memberPermissions?.has(
+        PermissionFlagsBits.ManageGuild
+      )) {
         return interaction.reply({
           content: 'You need Manage Server permission to configure KatBot.',
           flags: MessageFlags.Ephemeral,
@@ -932,7 +861,7 @@ client.on(Events.InteractionCreate, async interaction => {
       const id = interaction.customId;
       const guildId = interaction.guildId;
 
-      if (id === 'setup_refresh' || id === 'setup_home') {
+      if (id === 'setup_home') {
         return showHome(interaction, true);
       }
 
@@ -961,7 +890,6 @@ client.on(Events.InteractionCreate, async interaction => {
         const config = getSettings(guildId);
 
         config.welcomeEnabled = !config.welcomeEnabled;
-
         saveData();
 
         return interaction.update(welcomePanel(guildId));
@@ -976,16 +904,16 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const input = new TextInputBuilder()
           .setCustomId('welcome_message')
-          .setLabel('Use {user} and {server} as placeholders')
-          .setPlaceholder('Welcome {user} to {server}!')
+          .setLabel('Use {user} and {server}')
           .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true)
-          .setMaxLength(1900)
-          .setValue(config.welcomeMessage);
+          .setRequired(false)
+          .setMaxLength(1900);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(input)
-        );
+        if (config.welcomeMessage) {
+          input.setValue(config.welcomeMessage);
+        }
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
 
         return interaction.showModal(modal);
       }
@@ -1011,70 +939,63 @@ client.on(Events.InteractionCreate, async interaction => {
           .setMaxLength(4)
           .setValue(String(config.statusInterval));
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(input)
-        );
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
 
         return interaction.showModal(modal);
       }
 
-      if (
-        id === 'status_edit_select' ||
-        id === 'status_delete_select'
-      ) {
+      if (id === 'status_edit_select' || id === 'status_delete_select') {
         const edit = id === 'status_edit_select';
 
         return interaction.reply({
           content: edit
             ? 'Choose an activity to edit:'
             : 'Choose an activity to delete:',
-          components: [
-            statusSelectRow(
-              guildId,
-              edit ? 'status_edit_pick' : 'status_delete_pick'
-            ),
-          ],
+          components: [statusSelectRow(
+            guildId,
+            edit ? 'status_edit_pick' : 'status_delete_pick'
+          )],
           flags: MessageFlags.Ephemeral,
         });
       }
 
       if (id === 'custom_add') {
         return interaction.reply({
-          content: 'Step 1/2 — Choose the embed color:',
-          components: [
-            presetSelectRow('custom_add_preset'),
-          ],
+          content: 'Step 1/2 — Choose an embed color:',
+          components: [presetSelectRow('custom_add_preset')],
           flags: MessageFlags.Ephemeral,
         });
       }
 
-      if (
-        id === 'custom_edit_select' ||
-        id === 'custom_delete_select'
-      ) {
+      if (id === 'custom_edit_select' || id === 'custom_delete_select') {
         const edit = id === 'custom_edit_select';
 
         return interaction.reply({
           content: edit
             ? 'Choose a command to edit:'
             : 'Choose a command to delete:',
-          components: [
-            commandSelectRow(
-              guildId,
-              edit ? 'custom_edit_pick' : 'custom_delete_pick'
-            ),
-          ],
+          components: [commandSelectRow(
+            guildId,
+            edit ? 'custom_edit_pick' : 'custom_delete_pick'
+          )],
           flags: MessageFlags.Ephemeral,
         });
       }
     }
 
+    // ---------- Select menus ----------
+
     if (interaction.isStringSelectMenu()) {
-      if (
-        !interaction.memberPermissions?.has(
-          PermissionFlagsBits.ManageGuild
-        )
-      ) {
+      if (!interaction.guildId) {
+        return interaction.reply({
+          content: 'Use this panel in a server.',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
+      if (!interaction.memberPermissions?.has(
+        PermissionFlagsBits.ManageGuild
+      )) {
         return interaction.reply({
           content: 'You need Manage Server permission to configure KatBot.',
           flags: MessageFlags.Ephemeral,
@@ -1082,51 +1003,25 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       const guildId = interaction.guildId;
-
-      if (!guildId) {
-        return interaction.reply({
-          content: 'Use this panel in a server.',
-          flags: MessageFlags.Ephemeral,
-        });
-      }
-
       const id = interaction.customId;
 
       if (id === 'custom_add_preset') {
-        const colorKey = interaction.values[0];
+        const presetKey = interaction.values[0];
+        const preset = embedPresets[presetKey];
 
-        if (!embedPresets[colorKey]) {
+        if (!preset) {
           return interaction.reply({
             content: 'Invalid embed color.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        return interaction.update({
-          content: `Color selected: **${embedPresets[colorKey].label}**.\n\nStep 2/2 — Choose response visibility:`,
-          components: [
-            visibilitySelectRow(`custom_add_visibility:${colorKey}`),
-          ],
-        });
-      }
-
-      if (id.startsWith('custom_add_visibility:')) {
-        const colorKey = id.slice('custom_add_visibility:'.length);
-        const visibility = interaction.values[0];
-
-        if (!embedPresets[colorKey]) {
-          return interaction.reply({
-            content: 'Invalid color selection. Start again.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
-        const modal = customCommandModal(
-          `custom_add_modal:${colorKey}:${visibility}`,
-          'Create Command'
+        return interaction.showModal(
+          customCommandModal(
+            `custom_add_modal:${presetKey}`,
+            'Create Command'
+          )
         );
-
-        return interaction.showModal(modal);
       }
 
       if (id.startsWith('custom_edit_preset:')) {
@@ -1140,51 +1035,21 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
-        const colorKey = interaction.values[0];
+        const presetKey = interaction.values[0];
 
-        if (!embedPresets[colorKey]) {
+        if (!embedPresets[presetKey]) {
           return interaction.reply({
             content: 'Invalid embed color.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        return interaction.update({
-          content: `Color selected: **${embedPresets[colorKey].label}**.\n\nChoose response visibility:`,
-          components: [
-            visibilitySelectRow(
-              `custom_edit_visibility:${name}:${colorKey}`,
-              getStoredCommandData(response).visibility
-            ),
-          ],
-        });
-      }
-
-      if (id.startsWith('custom_edit_visibility:')) {
-        const parts = id.split(':');
-        const name = parts[1];
-        const colorKey = parts[2];
-        const visibility = interaction.values[0];
-        const response = getSettings(guildId).customCommands[name];
-
-        if (
-          !embedPresets[colorKey] ||
-          typeof response !== 'string'
-        ) {
-          return interaction.reply({
-            content: 'Command not found. Start again.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
-        const data = getStoredCommandData(response);
-
         return interaction.showModal(
           customCommandModal(
-            `custom_edit_modal:${name}:${colorKey}:${visibility}`,
+            `custom_edit_modal:${name}:${presetKey}`,
             'Edit Command',
             name,
-            data.message
+            response
           )
         );
       }
@@ -1201,11 +1066,7 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         return interaction.showModal(
-          statusModal(
-            `status_edit_modal:${index}`,
-            'Edit Activity',
-            status
-          )
+          statusModal(`status_edit_modal:${index}`, 'Edit Activity', status)
         );
       }
 
@@ -1244,14 +1105,13 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const data = getStoredCommandData(response);
 
-        return interaction.update({
+        return interaction.reply({
           content: `Choose an embed color for /${name}:`,
-          components: [
-            presetSelectRow(
-              `custom_edit_preset:${name}`,
-              data.color
-            ),
-          ],
+          components: [presetSelectRow(
+            `custom_edit_preset:${name}`,
+            data.color
+          )],
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -1269,7 +1129,6 @@ client.on(Events.InteractionCreate, async interaction => {
         delete config.customCommands[name];
 
         saveData();
-
         await queueGuildCommandSync(guildId);
 
         return interaction.update({
@@ -1279,6 +1138,8 @@ client.on(Events.InteractionCreate, async interaction => {
       }
     }
 
+    // ---------- Modal submissions ----------
+
     if (interaction.isModalSubmit()) {
       if (!interaction.guildId) {
         return interaction.reply({
@@ -1287,11 +1148,9 @@ client.on(Events.InteractionCreate, async interaction => {
         });
       }
 
-      if (
-        !interaction.memberPermissions?.has(
-          PermissionFlagsBits.ManageGuild
-        )
-      ) {
+      if (!interaction.memberPermissions?.has(
+        PermissionFlagsBits.ManageGuild
+      )) {
         return interaction.reply({
           content: 'You need Manage Server permission to configure KatBot.',
           flags: MessageFlags.Ephemeral,
@@ -1304,8 +1163,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (id === 'welcome_modal') {
         config.welcomeMessage = interaction.fields
-          .getTextInputValue('welcome_message')
-          .trim();
+          .getTextInputValue('welcome_message').trim();
 
         saveData();
 
@@ -1320,11 +1178,7 @@ client.on(Events.InteractionCreate, async interaction => {
           interaction.fields.getTextInputValue('interval_seconds')
         );
 
-        if (
-          !Number.isInteger(seconds) ||
-          seconds < 30 ||
-          seconds > 3600
-        ) {
+        if (!Number.isInteger(seconds) || seconds < 30 || seconds > 3600) {
           return interaction.reply({
             content: 'Enter a whole number between 30 and 3600.',
             flags: MessageFlags.Ephemeral,
@@ -1342,18 +1196,12 @@ client.on(Events.InteractionCreate, async interaction => {
         });
       }
 
-      if (
-        id === 'status_add_modal' ||
-        id.startsWith('status_edit_modal:')
-      ) {
+      if (id === 'status_add_modal' || id.startsWith('status_edit_modal:')) {
         const type = interaction.fields
-          .getTextInputValue('activity_type')
-          .trim()
-          .toLowerCase();
+          .getTextInputValue('activity_type').trim().toLowerCase();
 
         const text = interaction.fields
-          .getTextInputValue('activity_text')
-          .trim();
+          .getTextInputValue('activity_text').trim();
 
         if (!Object.hasOwn(activityTypes, type)) {
           return interaction.reply({
@@ -1399,10 +1247,17 @@ client.on(Events.InteractionCreate, async interaction => {
       ) {
         const isEdit = id.startsWith('custom_edit_modal:');
         const parts = id.split(':');
-
-        const colorKey = isEdit ? parts[2] : parts[1];
-        const visibility = isEdit ? parts[3] : parts[2];
         const oldName = isEdit ? parts[1] : null;
+        const presetKey = isEdit ? parts[2] : parts[1];
+
+        const preset = embedPresets[presetKey];
+
+        if (!preset) {
+          return interaction.reply({
+            content: 'Invalid embed color. Please start again.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
 
         const rawName = interaction.fields
           .getTextInputValue('command_name');
@@ -1410,8 +1265,7 @@ client.on(Events.InteractionCreate, async interaction => {
         const name = cleanCommandName(rawName);
 
         const message = interaction.fields
-          .getTextInputValue('command_message')
-          .trim();
+          .getTextInputValue('command_message').trim();
 
         if (!isValidCommandName(name) || rawName.trim() !== name) {
           return interaction.reply({
@@ -1422,29 +1276,12 @@ client.on(Events.InteractionCreate, async interaction => {
 
         if (!message) {
           return interaction.reply({
-            content: 'Write a message before saving the command.',
+            content: 'Please write a message before saving.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        if (!embedPresets[colorKey]) {
-          return interaction.reply({
-            content: 'Invalid color selection. Please start again.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
-        if (!['public', 'private'].includes(visibility)) {
-          return interaction.reply({
-            content: 'Invalid visibility selection. Please start again.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
-        if (
-          !isEdit &&
-          Object.hasOwn(config.customCommands, name)
-        ) {
+        if (!isEdit && Object.hasOwn(config.customCommands, name)) {
           return interaction.reply({
             content: `/${name} already exists. Use Edit Command.`,
             flags: MessageFlags.Ephemeral,
@@ -1472,23 +1309,15 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
-        if (message.length > 4096) {
-          return interaction.reply({
-            content: 'The message must contain no more than 4096 characters.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-
-        const color = embedPresets[colorKey].color;
-
         if (oldName && oldName !== name) {
           delete config.customCommands[oldName];
         }
 
         config.customCommands[name] = JSON.stringify({
-          message,
-          color,
-          visibility,
+          content: message,
+          embed: {
+            color: preset.color,
+          },
         });
 
         saveData();
