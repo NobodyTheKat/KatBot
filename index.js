@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const fs = require('node:fs');
@@ -326,7 +325,7 @@ function welcomePanel(guildId) {
       'Welcome Settings',
       `**Welcome DMs:** ${config.welcomeEnabled ? 'Enabled' : 'Disabled'}\n` +
       `**Current message:**\n${config.welcomeMessage}\n\n` +
-      'Placeholders: `{user}` and `{server}`.'
+      'Placeholders: `{user}`, `{server}`.'
     )],
     components: [
       new ActionRowBuilder().addComponents(
@@ -393,18 +392,122 @@ function statusesPanel(guildId) {
   };
 }
 
+/*
+ * Supported custom command response format:
+ *
+ * {
+ *   "visibility": "public",
+ *   "embed": {
+ *     "title": "Welcome to {server}!",
+ *     "description": "Hello {user.mention}! There are {server.members} members.",
+ *     "color": "#3498DB"
+ *   }
+ * }
+ *
+ * Only title, description and color are supported in the embed.
+ */
+
 function getStoredCommandData(response) {
   try {
     const parsed = JSON.parse(response);
-    if (parsed && typeof parsed === 'object') {
+
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      // Backwards compatibility with older commands that stored plain content.
       return {
-        content: parsed.content || '',
-        embed: parsed.embed || {},
+        content: typeof parsed.content === 'string' ? parsed.content : '',
+        embed: parsed.embed && typeof parsed.embed === 'object'
+          ? parsed.embed
+          : {},
+        visibility: parsed.visibility === 'private' ? 'private' : 'public',
       };
     }
   } catch {}
 
-  return { content: typeof response === 'string' ? response : '', embed: {} };
+  return {
+    content: typeof response === 'string' ? response : '',
+    embed: {},
+    visibility: 'public',
+  };
+}
+
+function replacePlaceholders(text, interaction) {
+  const guild = interaction.guild;
+  const user = interaction.user;
+  const channel = interaction.channel;
+  const now = new Date();
+
+  const replacements = {
+    '{user}': user.username,
+    '{user.mention}': `<@${user.id}>`,
+    '{user.id}': user.id,
+    '{user.tag}': user.tag || user.username,
+    '{username}': user.username,
+    '{server}': guild?.name || 'Direct Message',
+    '{server.id}': guild?.id || '',
+    '{server.members}': String(guild?.memberCount ?? 0),
+    '{server.owner}': guild?.ownerId ? `<@${guild.ownerId}>` : 'Unknown',
+    '{channel}': channel?.name || 'Unknown',
+    '{channel.mention}': channel?.id ? `<#${channel.id}>` : '',
+    '{time}': now.toLocaleTimeString('en-GB', { hour12: false }),
+    '{date}': now.toLocaleDateString('en-GB'),
+    '{timestamp}': String(Math.floor(now.getTime() / 1000)),
+    '{bot}': client.user?.username || 'KatBot',
+  };
+
+  return String(text || '').replace(
+    /\{user\.mention\}|\{user\.id\}|\{user\.tag\}|\{server\.members\}|\{server\.owner\}|\{server\.id\}|\{channel\.mention\}|\{timestamp\}|\{username\}|\{server\}|\{channel\}|\{user\}|\{time\}|\{date\}|\{bot\}/g,
+    match => replacements[match] ?? match
+  );
+}
+
+function normalizeEmbedColor(color) {
+  if (typeof color === 'string') {
+    if (!/^#?[0-9a-f]{6}$/i.test(color)) return null;
+    return parseInt(color.replace('#', ''), 16);
+  }
+
+  if (Number.isInteger(color) && color >= 0 && color <= 0xFFFFFF) {
+    return color;
+  }
+
+  return null;
+}
+
+function renderCustomResponse(response, interaction) {
+  const data = getStoredCommandData(response);
+  const payload = {};
+  const content = replacePlaceholders(data.content, interaction).trim();
+
+  if (content) payload.content = content.slice(0, 2000);
+
+  const e = data.embed || {};
+  const embedData = {};
+
+  if (typeof e.title === 'string' && e.title.trim()) {
+    embedData.title = replacePlaceholders(e.title, interaction).slice(0, 256);
+  }
+
+  if (typeof e.description === 'string' && e.description.trim()) {
+    embedData.description = replacePlaceholders(e.description, interaction).slice(0, 4096);
+  }
+
+  const color = normalizeEmbedColor(e.color);
+  if (color !== null) embedData.color = color;
+
+  if (embedData.title || embedData.description) {
+    payload.embeds = [new EmbedBuilder(embedData)];
+  }
+
+  if (!payload.content && !payload.embeds) {
+    payload.content = 'This command has no valid message configured.';
+  }
+
+  payload.allowedMentions = { parse: [], users: [], roles: [], repliedUser: false };
+
+  return {
+    payload,
+    visibility: data.visibility,
+  };
 }
 
 function commandsPanel(guildId) {
@@ -412,8 +515,8 @@ function commandsPanel(guildId) {
   const list = entries.length
     ? entries.map(([name, response]) => {
       const data = getStoredCommandData(response);
-      const preview = data.content || data.embed.title || 'Embed';
-      return `**/${name}** → ${String(preview).slice(0, 70)}`;
+      const preview = data.content || data.embed.title || data.embed.description || 'Embed';
+      return `**/${name}** · ${data.visibility === 'private' ? 'Private' : 'Public'} · ${String(preview).slice(0, 60)}`;
     }).join('\n')
     : 'No custom commands have been created yet.';
 
@@ -482,18 +585,40 @@ function presetSelectRow(customId, currentColor = null) {
   const selected = Object.entries(embedPresets).find(
     ([, preset]) => preset.color &&
       preset.color.toLowerCase() === String(currentColor || '').toLowerCase()
-  )?.[0] || 'blurple';
+  )?.[0] || (currentColor === null ? 'blurple' : 'none');
 
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(customId)
-      .setPlaceholder('Choose an embed style')
+      .setPlaceholder('Choose an embed color')
       .addOptions(Object.entries(embedPresets).map(([value, preset]) => ({
         label: preset.label,
         value,
         description: preset.color || 'No color',
         default: value === selected,
       })))
+  );
+}
+
+function visibilitySelectRow(customId, currentVisibility = 'public') {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(customId)
+      .setPlaceholder('Choose response visibility')
+      .addOptions([
+        {
+          label: 'Public response',
+          description: 'Everyone in the channel can see it.',
+          value: 'public',
+          default: currentVisibility !== 'private',
+        },
+        {
+          label: 'Private response',
+          description: 'Only the command user can see it.',
+          value: 'private',
+          default: currentVisibility === 'private',
+        },
+      ])
   );
 }
 
@@ -534,116 +659,25 @@ function customCommandModal(customId, title, name = '', response = '') {
     .setMaxLength(32)
     .setValue(name);
 
-  const messageInput = new TextInputBuilder()
-    .setCustomId('command_message')
-    .setLabel('Message')
+  const responseInput = new TextInputBuilder()
+    .setCustomId('command_response_json')
+    .setLabel('JSON: title, description, color')
     .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setMaxLength(2000)
-    .setValue(previous.content || '');
-
-  const titleInput = new TextInputBuilder()
-    .setCustomId('embed_title')
-    .setLabel('Embed title (optional)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setMaxLength(256)
-    .setValue(previous.embed.title || '');
-
-  const imageInput = new TextInputBuilder()
-    .setCustomId('embed_image')
-    .setLabel('Image URL (optional)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setMaxLength(400)
-    .setValue(previous.embed.image || '');
+    .setRequired(true)
+    .setMaxLength(4000)
+    .setValue(JSON.stringify({
+      visibility: previous.visibility || 'public',
+      embed: {
+        title: previous.embed.title || '',
+        description: previous.embed.description || previous.content || '',
+        color: previous.embed.color || '#5865F2',
+      },
+    }, null, 2).slice(0, 4000));
 
   return modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
-    new ActionRowBuilder().addComponents(messageInput),
-    new ActionRowBuilder().addComponents(titleInput),
-    new ActionRowBuilder().addComponents(imageInput),
+    new ActionRowBuilder().addComponents(responseInput),
   );
-}
-
-function renderCustomResponse(response) {
-  const data = getStoredCommandData(response);
-  const payload = {};
-  const content = String(data.content || '').trim();
-
-  if (content) payload.content = content.slice(0, 2000);
-
-  const e = data.embed || {};
-  const embed = new EmbedBuilder();
-  let hasEmbed = false;
-
-  if (typeof e.title === 'string' && e.title.trim()) {
-    embed.setTitle(e.title.slice(0, 256));
-    hasEmbed = true;
-  }
-
-  if (typeof e.description === 'string' && e.description.trim()) {
-    embed.setDescription(e.description.slice(0, 4096));
-    hasEmbed = true;
-  }
-
-  if (typeof e.color === 'string' && /^#?[0-9a-f]{6}$/i.test(e.color)) {
-    embed.setColor(parseInt(e.color.replace('#', ''), 16));
-  } else if (Number.isInteger(e.color) && e.color >= 0 && e.color <= 0xFFFFFF) {
-    embed.setColor(e.color);
-  }
-
-  if (typeof e.image === 'string' && /^https?:\/\/\S+$/i.test(e.image)) {
-    embed.setImage(e.image);
-    hasEmbed = true;
-  }
-
-  if (typeof e.url === 'string' && /^https?:\/\/\S+$/i.test(e.url)) {
-    embed.setURL(e.url);
-    hasEmbed = true;
-  }
-
-  if (typeof e.author === 'string' && e.author.trim()) {
-    embed.setAuthor({ name: e.author.slice(0, 256) });
-    hasEmbed = true;
-  }
-
-  if (typeof e.footer === 'string' && e.footer.trim()) {
-    embed.setFooter({ text: e.footer.slice(0, 2048) });
-    hasEmbed = true;
-  }
-
-  if (e.timestamp === true) {
-    embed.setTimestamp();
-    hasEmbed = true;
-  }
-
-  if (Array.isArray(e.fields)) {
-    const fields = e.fields
-      .filter(field => field &&
-        typeof field.name === 'string' &&
-        typeof field.value === 'string')
-      .slice(0, 25)
-      .map(field => ({
-        name: field.name.slice(0, 256),
-        value: field.value.slice(0, 1024),
-        inline: field.inline === true,
-      }));
-
-    if (fields.length) {
-      embed.addFields(fields);
-      hasEmbed = true;
-    }
-  }
-
-  if (hasEmbed) payload.embeds = [embed];
-
-  if (!payload.content && !payload.embeds) {
-    payload.content = 'This command has no valid message configured.';
-  }
-
-  payload.allowedMentions = { parse: [] };
-  return payload;
 }
 
 async function showHome(interaction, update = false) {
@@ -687,9 +721,11 @@ client.on(Events.GuildMemberAdd, async member => {
   const config = getSettings(member.guild.id);
   if (!config.welcomeEnabled) return;
 
-  const message = config.welcomeMessage
-    .replaceAll('{user}', member.user.username)
-    .replaceAll('{server}', member.guild.name);
+  const message = replacePlaceholders(config.welcomeMessage, {
+    guild: member.guild,
+    user: member.user,
+    channel: null,
+  });
 
   try {
     await member.send(message);
@@ -730,14 +766,14 @@ client.on(Events.InteractionCreate, async interaction => {
       const response = getSettings(interaction.guildId).customCommands[name];
 
       if (typeof response === 'string') {
-        // A public interaction acknowledgement, followed by a separate public message.
-        await interaction.reply({
-          content: '\u200B',
-          allowedMentions: { parse: [] },
-        });
+        const rendered = renderCustomResponse(response, interaction);
 
-        await interaction.channel.send(renderCustomResponse(response));
-        return;
+        return interaction.reply({
+          ...rendered.payload,
+          flags: rendered.visibility === 'private'
+            ? MessageFlags.Ephemeral
+            : undefined,
+        });
       }
 
       return;
@@ -850,7 +886,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (id === 'custom_add') {
         return interaction.reply({
-          content: 'Choose an embed style for the new command:',
+          content: 'Choose an embed color:',
           components: [presetSelectRow('custom_add_preset')],
           flags: MessageFlags.Ephemeral,
         });
@@ -889,17 +925,50 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (id === 'custom_add_preset') {
         const presetKey = interaction.values[0];
+
         if (!embedPresets[presetKey]) {
           return interaction.reply({
-            content: 'Invalid embed style.',
+            content: 'Invalid embed color.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        return interaction.showModal(customCommandModal(
+        const preset = embedPresets[presetKey];
+
+        const modal = customCommandModal(
           `custom_add_modal:${presetKey}`,
           'Create Command'
-        ));
+        );
+
+        // The selected color is the default in the JSON editor.
+        const input = new TextInputBuilder()
+          .setCustomId('command_response_json')
+          .setLabel('JSON: title, description, color')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(4000)
+          .setValue(JSON.stringify({
+            visibility: 'public',
+            embed: {
+              title: '',
+              description: '',
+              color: preset.color,
+            },
+          }, null, 2).slice(0, 4000));
+
+        modal.setComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('command_name')
+              .setLabel('Command name (no slash)')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+              .setMaxLength(32)
+          ),
+          new ActionRowBuilder().addComponents(input),
+        );
+
+        return interaction.showModal(modal);
       }
 
       if (id.startsWith('custom_edit_preset:')) {
@@ -914,19 +983,50 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         const presetKey = interaction.values[0];
+
         if (!embedPresets[presetKey]) {
           return interaction.reply({
-            content: 'Invalid embed style.',
+            content: 'Invalid embed color.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        return interaction.showModal(customCommandModal(
-          `custom_edit_modal:${name}:${presetKey}`,
-          'Edit Command',
-          name,
-          response
-        ));
+        const data = getStoredCommandData(response);
+        const preset = embedPresets[presetKey];
+
+        const modal = new ModalBuilder()
+          .setCustomId(`custom_edit_modal:${name}:${presetKey}`)
+          .setTitle('Edit Command');
+
+        const nameInput = new TextInputBuilder()
+          .setCustomId('command_name')
+          .setLabel('Command name (no slash)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(32)
+          .setValue(name);
+
+        const responseInput = new TextInputBuilder()
+          .setCustomId('command_response_json')
+          .setLabel('JSON: title, description, color')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(4000)
+          .setValue(JSON.stringify({
+            visibility: data.visibility || 'public',
+            embed: {
+              title: data.embed.title || '',
+              description: data.embed.description || data.content || '',
+              color: preset.color,
+            },
+          }, null, 2).slice(0, 4000));
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(nameInput),
+          new ActionRowBuilder().addComponents(responseInput),
+        );
+
+        return interaction.showModal(modal);
       }
 
       if (id === 'status_edit_pick') {
@@ -980,8 +1080,9 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         const data = getStoredCommandData(response);
+
         return interaction.reply({
-          content: `Choose an embed style for /${name}:`,
+          content: `Choose an embed color for /${name}:`,
           components: [presetSelectRow(
             `custom_edit_preset:${name}`,
             data.embed.color
@@ -1034,6 +1135,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (id === 'welcome_modal') {
         config.welcomeMessage = interaction.fields
           .getTextInputValue('welcome_message').trim();
+
         saveData();
 
         return interaction.reply({
@@ -1067,6 +1169,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (id === 'status_add_modal' || id.startsWith('status_edit_modal:')) {
         const type = interaction.fields
           .getTextInputValue('activity_type').trim().toLowerCase();
+
         const text = interaction.fields
           .getTextInputValue('activity_text').trim();
 
@@ -1114,21 +1217,12 @@ client.on(Events.InteractionCreate, async interaction => {
       ) {
         const isEdit = id.startsWith('custom_edit_modal:');
         const parts = id.split(':');
-        const presetKey = isEdit ? parts[2] : parts[1];
-        const preset = embedPresets[presetKey];
-
-        if (!preset) {
-          return interaction.reply({
-            content: 'Invalid embed style. Reopen the command editor.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
+        const oldName = isEdit ? parts[1] : null;
 
         const rawName = interaction.fields.getTextInputValue('command_name');
         const name = cleanCommandName(rawName);
-        const message = interaction.fields.getTextInputValue('command_message').trim();
-        const title = interaction.fields.getTextInputValue('embed_title').trim();
-        const image = interaction.fields.getTextInputValue('embed_image').trim();
+        const rawJson = interaction.fields
+          .getTextInputValue('command_response_json').trim();
 
         if (!isValidCommandName(name) || rawName.trim() !== name) {
           return interaction.reply({
@@ -1137,21 +1231,75 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
-        if (!message && !title && !image) {
+        let parsed;
+
+        try {
+          parsed = JSON.parse(rawJson);
+        } catch {
           return interaction.reply({
-            content: 'Enter a message, an embed title, or an image URL.',
+            content: 'Invalid JSON. Check the braces, quotation marks and commas.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        if (image && !/^https?:\/\/\S+$/i.test(image)) {
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
           return interaction.reply({
-            content: 'The image must be a valid HTTP or HTTPS URL.',
+            content: 'The JSON must be an object.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        const oldName = isEdit ? parts[1] : null;
+        const visibility = parsed.visibility === 'private' ? 'private' : 'public';
+        const embed = parsed.embed;
+
+        if (!embed || typeof embed !== 'object' || Array.isArray(embed)) {
+          return interaction.reply({
+            content: 'Add an "embed" object containing title, description and color.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        const allowedKeys = new Set(['title', 'description', 'color']);
+        const invalidKeys = Object.keys(embed).filter(key => !allowedKeys.has(key));
+
+        if (invalidKeys.length) {
+          return interaction.reply({
+            content: `Unsupported embed property: ${invalidKeys.join(', ')}. Only title, description and color are allowed.`,
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        const title = typeof embed.title === 'string' ? embed.title.trim() : '';
+        const description = typeof embed.description === 'string'
+          ? embed.description.trim()
+          : '';
+
+        if (!title && !description) {
+          return interaction.reply({
+            content: 'Add at least a title or a description to the embed.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        if (title.length > 256 || description.length > 4096) {
+          return interaction.reply({
+            content: 'Title must be 256 characters or fewer and description 4096 or fewer.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        let color = null;
+
+        if (embed.color !== null && embed.color !== undefined && embed.color !== '') {
+          color = normalizeEmbedColor(embed.color);
+
+          if (color === null) {
+            return interaction.reply({
+              content: 'Color must be a six-digit hex value such as #3498DB, or null.',
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+        }
 
         if (!isEdit && Object.hasOwn(config.customCommands, name)) {
           return interaction.reply({
@@ -1177,26 +1325,23 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
-        const hasEmbed = Boolean(title || image || preset.color);
-        let response;
+        const storedEmbed = { title, description };
 
-        if (hasEmbed) {
-          const embed = {};
-
-          if (title) embed.title = title;
-          if (preset.color) embed.color = preset.color;
-          if (image) embed.image = image;
-
-          response = JSON.stringify({ content: message, embed });
+        if (color !== null) {
+          storedEmbed.color = `#${color.toString(16).padStart(6, '0').toUpperCase()}`;
         } else {
-          response = message;
+          storedEmbed.color = null;
         }
 
         if (oldName && oldName !== name) {
           delete config.customCommands[oldName];
         }
 
-        config.customCommands[name] = response;
+        config.customCommands[name] = JSON.stringify({
+          visibility,
+          embed: storedEmbed,
+        });
+
         saveData();
         await queueGuildCommandSync(guildId);
 
