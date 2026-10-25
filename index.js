@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const {
@@ -98,9 +97,69 @@ function isValidCommandName(name) {
     !RESERVED_COMMANDS.has(name);
 }
 
+/*
+ * Older versions may have saved a command as a string.
+ * Other versions may have saved it as an object.
+ * This helper safely extracts the response without calling
+ * .slice() on an object.
+ */
+function getCommandResponse(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (isObject(value)) {
+    if (typeof value.response === 'string') {
+      return value.response;
+    }
+
+    if (typeof value.content === 'string') {
+      return value.content;
+    }
+
+    if (typeof value.description === 'string') {
+      return value.description;
+    }
+  }
+
+  return '';
+}
+
+function normalizeCustomCommands(value) {
+  const commands = {};
+  let changed = false;
+
+  if (!isObject(value)) {
+    return { commands, changed: true };
+  }
+
+  for (const [name, rawResponse] of Object.entries(value)) {
+    if (!isValidCommandName(name)) {
+      changed = true;
+      continue;
+    }
+
+    const response = getCommandResponse(rawResponse);
+
+    if (!response.trim()) {
+      changed = true;
+      continue;
+    }
+
+    // Normalize commands to strings for backward compatibility.
+    commands[name] = response;
+
+    if (typeof rawResponse !== 'string' || rawResponse !== response) {
+      changed = true;
+    }
+  }
+
+  return { commands, changed };
+}
+
 function normalizeSettings(raw) {
   const result = isObject(raw) ? raw : {};
-  let changed = false;
+  let changed = !isObject(raw);
 
   for (const [guildId, original] of Object.entries(result)) {
     if (!isObject(original)) {
@@ -153,23 +212,41 @@ function normalizeSettings(raw) {
       changed = true;
     }
 
-    if (!isObject(config.customCommands)) {
-      config.customCommands = {};
-      changed = true;
-    }
+    const normalizedCommands = normalizeCustomCommands(config.customCommands);
+    config.customCommands = normalizedCommands.commands;
 
-    for (const [name, response] of Object.entries(config.customCommands)) {
-      if (
-        !isValidCommandName(name) ||
-        typeof response !== 'string'
-      ) {
-        delete config.customCommands[name];
-        changed = true;
-      }
+    if (normalizedCommands.changed) {
+      changed = true;
     }
   }
 
   return { settings: result, changed };
+}
+
+function saveSettings() {
+  const temporaryFile = `${DATA_FILE}.tmp`;
+
+  try {
+    fs.writeFileSync(
+      temporaryFile,
+      JSON.stringify(settings, null, 2),
+      'utf8'
+    );
+
+    fs.renameSync(temporaryFile, DATA_FILE);
+  } catch (error) {
+    console.error('Could not save settings:', error.message);
+
+    try {
+      if (fs.existsSync(temporaryFile)) {
+        fs.unlinkSync(temporaryFile);
+      }
+    } catch {
+      // Ignore cleanup errors.
+    }
+
+    throw error;
+  }
 }
 
 function loadSettings() {
@@ -194,23 +271,6 @@ function loadSettings() {
   }
 }
 
-function saveSettings() {
-  try {
-    const temporaryFile = `${DATA_FILE}.tmp`;
-
-    fs.writeFileSync(
-      temporaryFile,
-      JSON.stringify(settings, null, 2),
-      'utf8'
-    );
-
-    fs.renameSync(temporaryFile, DATA_FILE);
-  } catch (error) {
-    console.error('Could not save settings:', error.message);
-    throw error;
-  }
-}
-
 function getSettings(guildId) {
   if (!settings[guildId]) {
     settings[guildId] = {
@@ -226,27 +286,73 @@ function getSettings(guildId) {
 
   const config = settings[guildId];
 
-  // Repair malformed values if settings were changed outside the bot.
-  if (!isObject(config.customCommands)) {
-    config.customCommands = {};
+  if (!Array.isArray(config.statuses)) {
+    config.statuses = DEFAULT_SETTINGS.statuses.map(x => ({ ...x }));
     saveSettings();
   }
 
-  let changed = false;
-
-  for (const [name, response] of Object.entries(config.customCommands)) {
-    if (!isValidCommandName(name) || typeof response !== 'string') {
-      delete config.customCommands[name];
-      changed = true;
-    }
+  if (!Number.isInteger(config.statusInterval)) {
+    config.statusInterval = DEFAULT_SETTINGS.statusInterval;
+    saveSettings();
   }
 
-  if (changed) saveSettings();
+  const normalizedCommands = normalizeCustomCommands(config.customCommands);
+
+  if (normalizedCommands.changed) {
+    config.customCommands = normalizedCommands.commands;
+    saveSettings();
+  }
 
   return config;
 }
 
 loadSettings();
+
+/* -------------------- PLACEHOLDERS -------------------- */
+
+/*
+ * Available placeholders:
+ *
+ * {user}         Mention the person who used the command.
+ * {username}     Username of that person.
+ * {userId}       Discord ID of that person.
+ * {server}       Server name.
+ * {serverId}     Server ID.
+ * {memberCount}  Current server member count.
+ * {channel}      Channel name.
+ * {channelId}    Channel ID.
+ * {bot}          Bot username.
+ *
+ * Welcome messages also support these placeholders.
+ */
+
+function replacePlaceholders(text, interaction) {
+  if (typeof text !== 'string') return '';
+
+  const user = interaction.user;
+  const guild = interaction.guild;
+  const channel = interaction.channel;
+
+  const replacements = {
+    '{user}': `<@${user.id}>`,
+    '{username}': user.username,
+    '{userId}': user.id,
+    '{server}': guild?.name || 'Direct Message',
+    '{serverId}': guild?.id || '',
+    '{memberCount}': String(guild?.memberCount ?? ''),
+    '{channel}': channel && 'name' in channel ? channel.name : '',
+    '{channelId}': channel?.id || '',
+    '{bot}': client.user?.username || 'KatBot',
+  };
+
+  let output = text;
+
+  for (const [placeholder, value] of Object.entries(replacements)) {
+    output = output.replaceAll(placeholder, String(value));
+  }
+
+  return output;
+}
 
 /* -------------------- GITHUB UPDATER -------------------- */
 
@@ -336,7 +442,6 @@ function updateFromGitHub() {
       };
     }
 
-    // Refuse to overwrite uncommitted tracked changes.
     const dirty = runGit(['status', '--porcelain']);
 
     if (dirty.status !== 0) {
@@ -494,7 +599,8 @@ async function syncGuildCustomCommands(guildId) {
   const commands = Object.entries(config.customCommands)
     .filter(([name, response]) =>
       isValidCommandName(name) &&
-      typeof response === 'string'
+      typeof getCommandResponse(response) === 'string' &&
+      getCommandResponse(response).trim().length > 0
     )
     .slice(0, 100)
     .map(([name]) =>
@@ -636,7 +742,7 @@ function welcomePanel(guildId) {
         'Welcome Messages',
         `**Enabled:** ${config.welcomeEnabled ? 'Yes' : 'No'}\n\n` +
         `**Current message:**\n${config.welcomeMessage}\n\n` +
-        'Placeholders: `{user}`, `{server}`.'
+        'Placeholders: `{user}`, `{username}`, `{userId}`, `{server}`, `{serverId}`, `{memberCount}`, `{channel}`, `{channelId}`, `{bot}`.'
       ),
     ],
     components: [
@@ -690,12 +796,14 @@ function commandsPanel(guildId) {
 
   const entries = Object.entries(config.customCommands)
     .filter(([name, response]) =>
-      isValidCommandName(name) && typeof response === 'string'
+      isValidCommandName(name) &&
+      typeof getCommandResponse(response) === 'string' &&
+      getCommandResponse(response).trim().length > 0
     );
 
   const description = entries.length
     ? entries.map(([name, response]) =>
-        `**/${name}** → ${response.slice(0, 100)}`
+        `**/${name}** → ${getCommandResponse(response).slice(0, 100)}`
       ).join('\n')
     : 'No custom commands have been created yet.';
 
@@ -704,7 +812,8 @@ function commandsPanel(guildId) {
       panelEmbed(
         'Custom Commands',
         `${description}\n\n` +
-        'Create commands with custom text responses. Changes are saved automatically.'
+        'Create commands with custom text responses. Changes are saved automatically.\n\n' +
+        '**Placeholders:** `{user}`, `{username}`, `{userId}`, `{server}`, `{serverId}`, `{memberCount}`, `{channel}`, `{channelId}`, `{bot}`.'
       ),
     ],
     components: [
@@ -750,7 +859,8 @@ function statusSelect(guildId, customId) {
 function commandSelect(guildId, customId) {
   const commands = Object.entries(getSettings(guildId).customCommands)
     .filter(([name, response]) =>
-      isValidCommandName(name) && typeof response === 'string'
+      isValidCommandName(name) &&
+      getCommandResponse(response).trim().length > 0
     );
 
   return selectRow(
@@ -812,7 +922,7 @@ function commandModal(customId, title, name = '', response = '') {
     },
     {
       id: 'command_response',
-      label: 'Text response',
+      label: 'Text response; placeholders are supported',
       value: response,
       style: TextInputStyle.Paragraph,
       maxLength: 2000,
@@ -870,12 +980,26 @@ client.on(Events.GuildMemberAdd, async member => {
 
     if (!config.welcomeEnabled) return;
 
-    const message = config.welcomeMessage
+    const message = replacePlaceholders(
+      config.welcomeMessage,
+      {
+        user: member.user,
+        guild: member.guild,
+        channel: null,
+      }
+    );
+
+    // Welcome messages use the joining member as {user}.
+    const welcomeMessage = message
       .replaceAll('{user}', `<@${member.id}>`)
-      .replaceAll('{server}', member.guild.name);
+      .replaceAll('{username}', member.user.username)
+      .replaceAll('{userId}', member.id)
+      .replaceAll('{server}', member.guild.name)
+      .replaceAll('{serverId}', member.guild.id)
+      .replaceAll('{memberCount}', String(member.guild.memberCount ?? ''));
 
     await member.send({
-      content: message,
+      content: welcomeMessage.slice(0, 2000),
       allowedMentions: { users: [member.id] },
     });
   } catch (error) {
@@ -929,11 +1053,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const result = updateFromGitHub();
 
-        if (!result.ok) {
-          return interaction.editReply(result.message);
-        }
-
-        if (!result.updated) {
+        if (!result.ok || !result.updated) {
           return interaction.editReply(result.message);
         }
 
@@ -950,11 +1070,14 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       const config = getSettings(interaction.guildId);
-      const response = config.customCommands[name];
+      const rawResponse = config.customCommands[name];
+      const response = getCommandResponse(rawResponse);
 
-      if (typeof response === 'string') {
+      if (response.trim()) {
+        const output = replacePlaceholders(response, interaction);
+
         return interaction.reply({
-          content: response.slice(0, 2000),
+          content: output.slice(0, 2000),
           allowedMentions: { parse: [] },
         });
       }
@@ -1014,7 +1137,7 @@ client.on(Events.InteractionCreate, async interaction => {
           makeModal('welcome_modal', 'Edit Welcome Message', [
             {
               id: 'welcome_message',
-              label: 'Use {user} and {server}',
+              label: 'Use {user}, {username} and {server}',
               value: config.welcomeMessage,
               style: TextInputStyle.Paragraph,
               maxLength: 1900,
@@ -1044,7 +1167,7 @@ client.on(Events.InteractionCreate, async interaction => {
         );
       }
 
-      if (id === 'status_edit_select') {
+      if (id === 'status_edit_select' || id === 'status_delete_select') {
         const config = getSettings(guildId);
 
         if (config.statuses.length === 0) {
@@ -1054,26 +1177,15 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
-        return interaction.reply({
-          content: 'Select an activity to edit.',
-          components: [statusSelect(guildId, 'status_edit_pick')],
-          flags: MessageFlags.Ephemeral,
-        });
-      }
-
-      if (id === 'status_delete_select') {
-        const config = getSettings(guildId);
-
-        if (config.statuses.length === 0) {
-          return interaction.reply({
-            content: 'No activities are available.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
+        const customId = id === 'status_edit_select'
+          ? 'status_edit_pick'
+          : 'status_delete_pick';
 
         return interaction.reply({
-          content: 'Select an activity to delete.',
-          components: [statusSelect(guildId, 'status_delete_pick')],
+          content: id === 'status_edit_select'
+            ? 'Select an activity to edit.'
+            : 'Select an activity to delete.',
+          components: [statusSelect(guildId, customId)],
           flags: MessageFlags.Ephemeral,
         });
       }
@@ -1084,7 +1196,7 @@ client.on(Events.InteractionCreate, async interaction => {
         );
       }
 
-      if (id === 'custom_edit_select') {
+      if (id === 'custom_edit_select' || id === 'custom_delete_select') {
         const commands = Object.keys(getSettings(guildId).customCommands);
 
         if (commands.length === 0) {
@@ -1094,26 +1206,15 @@ client.on(Events.InteractionCreate, async interaction => {
           });
         }
 
-        return interaction.reply({
-          content: 'Select a command to edit or rename.',
-          components: [commandSelect(guildId, 'custom_edit_pick')],
-          flags: MessageFlags.Ephemeral,
-        });
-      }
-
-      if (id === 'custom_delete_select') {
-        const commands = Object.keys(getSettings(guildId).customCommands);
-
-        if (commands.length === 0) {
-          return interaction.reply({
-            content: 'No custom commands are available.',
-            flags: MessageFlags.Ephemeral,
-          });
-        }
+        const customId = id === 'custom_edit_select'
+          ? 'custom_edit_pick'
+          : 'custom_delete_pick';
 
         return interaction.reply({
-          content: 'Select a command to delete.',
-          components: [commandSelect(guildId, 'custom_delete_pick')],
+          content: id === 'custom_edit_select'
+            ? 'Select a command to edit or rename.'
+            : 'Select a command to delete.',
+          components: [commandSelect(guildId, customId)],
           flags: MessageFlags.Ephemeral,
         });
       }
@@ -1175,9 +1276,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (interaction.customId === 'custom_edit_pick') {
         const name = interaction.values[0];
-        const response = config.customCommands[name];
+        const response = getCommandResponse(config.customCommands[name]);
 
-        if (typeof response !== 'string') {
+        if (!response.trim()) {
           return interaction.reply({
             content: 'Command not found.',
             flags: MessageFlags.Ephemeral,
@@ -1192,7 +1293,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.customId === 'custom_delete_pick') {
         const name = interaction.values[0];
 
-        if (typeof config.customCommands[name] !== 'string') {
+        if (!getCommandResponse(config.customCommands[name]).trim()) {
           return interaction.reply({
             content: 'Command not found.',
             flags: MessageFlags.Ephemeral,
@@ -1339,10 +1440,7 @@ client.on(Events.InteractionCreate, async interaction => {
           .getTextInputValue('command_response')
           .trim();
 
-        if (
-          !isValidCommandName(name) ||
-          rawName !== name
-        ) {
+        if (!isValidCommandName(name) || rawName !== name) {
           return interaction.reply({
             content:
               'Use only lowercase letters, numbers, hyphens and underscores. Names must be 1–32 characters. /setup, /ping and /update are reserved.',
@@ -1361,7 +1459,10 @@ client.on(Events.InteractionCreate, async interaction => {
           ? id.slice('custom_edit_modal:'.length)
           : null;
 
-        if (id === 'custom_add_modal' && Object.hasOwn(config.customCommands, name)) {
+        if (
+          id === 'custom_add_modal' &&
+          Object.hasOwn(config.customCommands, name)
+        ) {
           return interaction.reply({
             content: `/${name} already exists.`,
             flags: MessageFlags.Ephemeral,
@@ -1403,8 +1504,13 @@ client.on(Events.InteractionCreate, async interaction => {
         } catch (error) {
           console.error('Could not save or sync custom command:', error);
 
-          // Restore the previous in-memory state if saving fails.
           config.customCommands = previous;
+
+          try {
+            saveSettings();
+          } catch (restoreError) {
+            console.error('Could not restore command settings:', restoreError);
+          }
 
           return interaction.reply({
             content: 'Could not save the command. Check the Termux log.',
@@ -1453,8 +1559,6 @@ async function startBot() {
       console.warn('Continuing with the current local version.');
     }
 
-    // If GitHub updated the code, this process may still have the old
-    // code loaded. Restart before connecting to Discord.
     if (result.ok && result.updated) {
       console.log('Update downloaded. Restarting to load the new version.');
       restartBot();
