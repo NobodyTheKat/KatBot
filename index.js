@@ -267,10 +267,11 @@ function replacePlaceholders(text, context) {
 }
 
 // --------------------------------------------------
-// COLORS
+// COLORS AND MESSAGE STYLES
 // --------------------------------------------------
 
 const embedPresets = {
+  plain: { label: 'Plain Text (no embed)', color: null },
   blurple: { label: 'Discord Blurple', color: '#5865F2' },
   red: { label: 'Red', color: '#ED4245' },
   orange: { label: 'Orange', color: '#F97316' },
@@ -281,21 +282,27 @@ const embedPresets = {
   purple: { label: 'Purple', color: '#9B59B6' },
   pink: { label: 'Pink', color: '#EB459E' },
   dark: { label: 'Dark', color: '#232428' },
-  none: { label: 'No color', color: null },
+  none: { label: 'Embed without color', color: null },
 };
 
 function presetSelectRow(customId, currentColor) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(customId)
-      .setPlaceholder('Choose an embed color')
+      .setPlaceholder('Choose Plain Text or an embed color')
       .addOptions(
         Object.entries(embedPresets).map(([value, preset]) => ({
           label: preset.label,
           value,
-          description: preset.color || 'No embed color',
-          default: preset.color === currentColor ||
-            (!currentColor && value === 'none'),
+          description: value === 'plain'
+            ? 'Normal message without an embed'
+            : (preset.color || 'Embed without a color'),
+          default: value === 'plain'
+            ? currentColor === '__plain__'
+            : (
+                preset.color === currentColor ||
+                (!currentColor && value === 'none')
+              ),
         }))
       )
   );
@@ -572,7 +579,7 @@ function commandsPanel(guildId) {
 
   const list = entries.length
     ? entries.map(([name, data]) =>
-      `**/${name}** · ${data.title || 'No title'}`
+      `**/${name}** · ${data.style === 'plain' ? 'Plain Text' : (data.title || 'No title')}`
     ).join('\n')
     : 'No custom commands have been created yet.';
 
@@ -696,7 +703,7 @@ function customCommandModal(customId, title, data = null) {
 
   const titleInput = new TextInputBuilder()
     .setCustomId('command_title')
-    .setLabel('Embed title (leave empty for no title)')
+    .setLabel('Embed title (optional)')
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setMaxLength(256)
@@ -705,14 +712,12 @@ function customCommandModal(customId, title, data = null) {
   const messageInput = new TextInputBuilder()
     .setCustomId('command_message')
     .setLabel('Message')
-    .setPlaceholder('Write your response here. Use {user}, {server}, etc.')
+    .setPlaceholder('Write your message here')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(4000)
     .setValue(data?.description || '');
 
-  // Discord limits a field label to 45 characters and a placeholder
-  // to 100 characters. Keep the reminder in the message below the modal.
   return modal.addComponents(
     new ActionRowBuilder().addComponents(nameInput),
     new ActionRowBuilder().addComponents(titleInput),
@@ -834,6 +839,18 @@ client.on(Events.InteractionCreate, async interaction => {
       const data = getSettings(interaction.guildId).customCommands[name];
 
       if (!data || typeof data !== 'object') return;
+
+      if (data.style === 'plain') {
+        return interaction.reply({
+          content: replacePlaceholders(data.description || '', interaction).slice(0, 2000),
+          allowedMentions: {
+            parse: [],
+            users: [],
+            roles: [],
+            repliedUser: false,
+          },
+        });
+      }
 
       const embed = new EmbedBuilder();
 
@@ -1006,7 +1023,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (id === 'custom_add') {
         return interaction.reply({
-          content: 'First, choose the embed color:',
+          content: '**Available placeholders:**\n' +
+            placeholderHelp +
+            '\n\nChoose **Plain Text** for a normal message without an embed, or choose a color for an embed. All custom-command responses are public.',
           components: [presetSelectRow('custom_add_preset')],
           flags: MessageFlags.Ephemeral,
         });
@@ -1060,25 +1079,22 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       if (id === 'custom_add_preset') {
-        const preset = embedPresets[interaction.values[0]];
+        const presetKey = interaction.values[0];
+        const preset = embedPresets[presetKey];
 
         if (!preset) {
           return interaction.reply({
-            content: 'Invalid color selection.',
+            content: 'Invalid message style or color selection.',
             flags: MessageFlags.Ephemeral,
           });
         }
 
-        const color = preset.color;
-
-        const modal = customCommandModal(
-          `custom_add_modal:${interaction.values[0]}`,
-          'Create Command'
+        return interaction.showModal(
+          customCommandModal(
+            `custom_add_modal:${presetKey}`,
+            'Create Command'
+          )
         );
-
-        // Store the selected color in the modal's custom ID.
-        // The modal itself contains only normal text fields.
-        return interaction.showModal(modal);
       }
 
       if (id.startsWith('custom_edit_preset:')) {
@@ -1160,11 +1176,11 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         return interaction.reply({
-          content: `Choose an embed color for /${name}:`,
+          content: `Edit /${name}.\n\n**Available placeholders:**\n${placeholderHelp}\n\nChoose Plain Text or an embed color.`,
           components: [
             presetSelectRow(
               `custom_edit_preset:${name}`,
-              data.color
+              data.style === 'plain' ? '__plain__' : data.color
             ),
           ],
           flags: MessageFlags.Ephemeral,
@@ -1325,7 +1341,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
         if (!preset) {
           return interaction.reply({
-            content: 'Invalid color selection. Please start again.',
+            content: 'Invalid message style or color selection. Please start again.',
             flags: MessageFlags.Ephemeral,
           });
         }
@@ -1399,11 +1415,19 @@ client.on(Events.InteractionCreate, async interaction => {
           delete config.customCommands[oldName];
         }
 
-        config.customCommands[name] = {
-          title,
-          description,
-          color: preset.color,
-        };
+        config.customCommands[name] = presetKey === 'plain'
+          ? {
+              style: 'plain',
+              title: '',
+              description,
+              color: null,
+            }
+          : {
+              style: 'embed',
+              title,
+              description,
+              color: preset.color,
+            };
 
         saveData();
         await queueGuildCommandSync(guildId);
