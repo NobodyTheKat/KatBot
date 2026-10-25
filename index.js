@@ -22,7 +22,7 @@ const {
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync, spawn } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 
 if (!process.env.DISCORD_TOKEN) {
   console.error('DISCORD_TOKEN is missing from the .env file.');
@@ -199,7 +199,7 @@ function cleanCommandName(input) {
 
 function isValidCommandName(name) {
   return /^[a-z0-9_-]{1,32}$/.test(name)
-    && !['setup', 'ping'].includes(name);
+    && !['setup', 'ping', 'update'].includes(name);
 }
 
 async function syncGuildCustomCommands(guildId) {
@@ -317,8 +317,6 @@ function welcomePanel(guildId) {
           .setStyle(ButtonStyle.Secondary)
       ),
     ],
-
-    ephemeral: true,
   };
 }
 
@@ -374,8 +372,6 @@ function statusesPanel(guildId) {
           .setStyle(ButtonStyle.Secondary)
       ),
     ],
-
-    ephemeral: true,
   };
 }
 
@@ -426,8 +422,6 @@ function commandsPanel(guildId) {
           .setStyle(ButtonStyle.Secondary)
       ),
     ],
-
-    ephemeral: true,
   };
 }
 
@@ -625,11 +619,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.deferReply({ ephemeral: true });
 
-        const gitDir = path.join(__dirname, '.git');
-
-        if (!fs.existsSync(gitDir)) {
+        if (!fs.existsSync(path.join(__dirname, '.git'))) {
           return interaction.editReply(
-            'The .git directory was not found. /update only works when KatBot was installed using Git.'
+            'Update unavailable: the .git directory was not found.'
           );
         }
 
@@ -660,7 +652,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           if (fetchResult.status !== 0) {
             throw new Error(
-              fetchResult.stderr || 'Git fetch failed.'
+              fetchResult.stderr || 'Could not fetch updates from GitHub.'
             );
           }
 
@@ -669,7 +661,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           if (localResult.status !== 0 || remoteResult.status !== 0) {
             throw new Error(
-              'Could not read the local or GitHub revision.'
+              'Could not read the local or remote Git revision. Check that the repository has a commit.'
             );
           }
 
@@ -678,7 +670,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           if (local === remote) {
             return interaction.editReply(
-              'KatBot is already up to date. No changes are needed.'
+              'KatBot is already up to date.'
             );
           }
 
@@ -691,7 +683,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           if (ancestorResult.status !== 0) {
             throw new Error(
-              'The local branch is not an ancestor of the GitHub version. No files were changed to avoid overwriting local changes or creating an unsafe merge.'
+              'The local version cannot be safely updated with a fast-forward. No update was applied.'
             );
           }
 
@@ -703,9 +695,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ]);
 
           if (changedResult.status !== 0) {
-            throw new Error(
-              'Could not determine which files will change.'
-            );
+            throw new Error('Could not determine which files will change.');
           }
 
           const packageChanged = changedResult.stdout
@@ -723,7 +713,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (updateResult.status !== 0) {
             throw new Error(
               updateResult.stderr ||
-              'Update failed. Check whether there are unsaved local changes.'
+              'Git could not safely apply the update. Check for local changes.'
             );
           }
 
@@ -736,49 +726,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
 
             if (installResult.status !== 0) {
-              throw new Error(
-                `The code was updated, but npm ci failed. Check dependencies and restart manually.\n${installResult.stderr || ''}`
+              console.error('npm ci failed:', installResult.stderr);
+
+              return interaction.editReply(
+                'The code was updated, but dependency installation failed. KatBot has not been intentionally stopped. Check the Termux output before restarting.'
               );
             }
           }
 
-          await interaction.editReply(
-            `Update completed (${local.slice(0, 7)} → ${remote.slice(0, 7)}). Starting a new KatBot instance…`
+          return interaction.editReply(
+            `GitHub update downloaded successfully (${local.slice(0, 7)} → ${remote.slice(0, 7)}).\n\n` +
+            'KatBot is still running on its current code. To apply the update, restart it from Termux: press Ctrl+C, then run `node index.js` again.'
           );
-
-          const child = spawn(process.execPath, [__filename], {
-            cwd: __dirname,
-            detached: true,
-            stdio: 'ignore',
-            env: {
-              ...process.env,
-              KATBOT_RESTARTED_BY_UPDATE: '1',
-            },
-          });
-
-          child.once('error', (error) => {
-            console.error(
-              'Error starting KatBot after /update:',
-              error
-            );
-          });
-
-          child.unref();
-
-          setTimeout(async () => {
-            try {
-              await client.destroy();
-            } catch {}
-
-            process.exit(0);
-          }, 2000).unref();
-
-          return;
         } catch (error) {
           console.error('Error during /update:', error);
 
           return interaction.editReply(
-            `Update failed: ${String(error.message || error).slice(0, 1500)}`
+            `Update failed. KatBot has not been intentionally stopped.\n${String(error.message || error).slice(0, 1200)}`
           );
         }
       }
@@ -838,15 +802,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (id === 'setup_welcome') {
-        return interaction.reply(welcomePanel(guildId));
+        return interaction.reply({
+          ...welcomePanel(guildId),
+          ephemeral: true,
+        });
       }
 
       if (id === 'setup_statuses') {
-        return interaction.reply(statusesPanel(guildId));
+        return interaction.reply({
+          ...statusesPanel(guildId),
+          ephemeral: true,
+        });
       }
 
       if (id === 'setup_commands') {
-        return interaction.reply(commandsPanel(guildId));
+        return interaction.reply({
+          ...commandsPanel(guildId),
+          ephemeral: true,
+        });
       }
 
       if (id === 'welcome_toggle') {
@@ -910,9 +883,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id === 'status_edit_select') {
         return interaction.reply({
           content: 'Choose an activity to edit:',
-          components: [
-            statusSelectRow(guildId, 'status_edit_pick'),
-          ],
+          components: [statusSelectRow(guildId, 'status_edit_pick')],
           ephemeral: true,
         });
       }
@@ -920,9 +891,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id === 'status_delete_select') {
         return interaction.reply({
           content: 'Choose an activity to delete:',
-          components: [
-            statusSelectRow(guildId, 'status_delete_pick'),
-          ],
+          components: [statusSelectRow(guildId, 'status_delete_pick')],
           ephemeral: true,
         });
       }
@@ -936,9 +905,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id === 'custom_edit_select') {
         return interaction.reply({
           content: 'Choose a command to edit:',
-          components: [
-            commandSelectRow(guildId, 'custom_edit_pick'),
-          ],
+          components: [commandSelectRow(guildId, 'custom_edit_pick')],
           ephemeral: true,
         });
       }
@@ -946,9 +913,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id === 'custom_delete_select') {
         return interaction.reply({
           content: 'Choose a command to delete:',
-          components: [
-            commandSelectRow(guildId, 'custom_delete_pick'),
-          ],
+          components: [commandSelectRow(guildId, 'custom_delete_pick')],
           ephemeral: true,
         });
       }
@@ -987,11 +952,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         return interaction.showModal(
-          statusModal(
-            `status_edit_modal:${index}`,
-            'Edit Activity',
-            status
-          )
+          statusModal(`status_edit_modal:${index}`, 'Edit Activity', status)
         );
       }
 
@@ -1029,12 +990,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         return interaction.showModal(
-          customCommandModal(
-            `custom_edit_modal:${name}`,
-            'Edit Command',
-            name,
-            response
-          )
+          customCommandModal(`custom_edit_modal:${name}`, 'Edit Command', name, response)
         );
       }
 
@@ -1193,7 +1149,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           rawName.trim().toLowerCase() !== name
         ) {
           return interaction.reply({
-            content: 'Invalid name. Use only lowercase letters, numbers, hyphens, or underscores; 1–32 characters. /setup and /ping are reserved.',
+            content: 'Invalid name. Use only lowercase letters, numbers, hyphens, or underscores; 1–32 characters. /setup, /ping, and /update are reserved.',
             ephemeral: true,
           });
         }
@@ -1218,8 +1174,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
         }
 
-        if (editingOldName && editingOldName !== name) {
-          delete config.customCommands[editingOldName];
+        if (editingOldName && editingOldName !== name && exists) {
+          return interaction.reply({
+            content: `Command /${name} already exists. Choose another name.`,
+            ephemeral: true,
+          });
         }
 
         if (
@@ -1232,13 +1191,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
         }
 
+        if (editingOldName && editingOldName !== name) {
+          delete config.customCommands[editingOldName];
+        }
+
         config.customCommands[name] = response;
 
         saveData();
         await queueGuildCommandSync(guildId);
 
         return interaction.reply({
-          content: `Command /${name} saved. It was updated without restarting KatBot; Discord may take a few seconds to display it.`,
+          content: `Command /${name} saved. Discord may take a few seconds to display it.`,
           ephemeral: true,
         });
       }
