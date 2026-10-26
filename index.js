@@ -177,72 +177,161 @@ function replaceWelcomePlaceholders(text, member) {
   });
 }
 
+
 /* -------------------- GITHUB UPDATER -------------------- */
-function runGit(args) {
-  return spawnSync('git', args, { cwd: __dirname, encoding: 'utf8', timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
-}
-function gitError(result) { return (result.stderr || result.stdout || 'Unknown Git error').trim(); }
+
+const GITHUB_RAW_URL =
+  `https://raw.githubusercontent.com/NobodyTheKat/KatBot/${encodeURIComponent(BRANCH)}/index.js`;
+
 function updateFromGitHub() {
-  if (updateRunning) return { ok: false, updated: false, message: 'An update is already running.' };
+  if (updateRunning) {
+    return Promise.resolve({
+      ok: false,
+      updated: false,
+      message: 'An update is already running.',
+    });
+  }
+
   updateRunning = true;
-  try {
-    const repo = runGit(['rev-parse', '--is-inside-work-tree']);
-    if (repo.status !== 0 || repo.stdout.trim() !== 'true') return { ok: false, updated: false, message: 'This folder is not a Git repository.' };
-    const fetch = runGit(['fetch', 'origin', BRANCH]);
-    if (fetch.status !== 0) return { ok: false, updated: false, message: `GitHub fetch failed: ${gitError(fetch)}` };
-    const localResult = runGit(['rev-parse', 'HEAD']);
-    const remoteResult = runGit(['rev-parse', `origin/${BRANCH}`]);
-    if (localResult.status !== 0 || remoteResult.status !== 0) return { ok: false, updated: false, message: 'Could not determine the current Git revisions.' };
-    const local = localResult.stdout.trim();
-    const remote = remoteResult.stdout.trim();
-    if (local === remote) return { ok: true, updated: false, message: 'KatBot is already up to date.' };
-    const ancestor = runGit(['merge-base', '--is-ancestor', 'HEAD', `origin/${BRANCH}`]);
-    if (ancestor.status !== 0) return { ok: false, updated: false, message: 'The local branch has diverged from GitHub. No update was applied.' };
-    const dirty = runGit(['status', '--porcelain']);
-    if (dirty.status !== 0) return { ok: false, updated: false, message: 'Could not check the working tree.' };
-    if (dirty.stdout.trim()) return { ok: false, updated: false, message: 'Local changes were detected. Commit or stash them before updating.' };
-    const changed = runGit(['diff', '--name-only', 'HEAD', `origin/${BRANCH}`]);
-    if (changed.status !== 0) return { ok: false, updated: false, message: `Could not inspect changed files: ${gitError(changed)}` };
-    const dependenciesChanged = changed.stdout.split(/\r?\n/).filter(Boolean).some(file => ['package.json', 'package-lock.json'].includes(file));
-    const merge = runGit(['merge', '--ff-only', `origin/${BRANCH}`]);
-    if (merge.status !== 0) return { ok: false, updated: false, message: `Git update failed: ${gitError(merge)}` };
-    if (dependenciesChanged) {
-      const install = spawnSync('npm', ['ci'], { cwd: __dirname, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024 });
-      if (install.status !== 0) return { ok: false, updated: true, needsRestart: false, message: `Source updated, but npm ci failed: ${gitError(install)}. Fix dependencies before restarting.` };
+
+  return (async () => {
+    const tempFile = path.join(__dirname, '.index.js.update.tmp');
+
+    try {
+      const response = await fetch(GITHUB_RAW_URL, {
+        cache: 'no-store',
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+        },
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (!response.ok) {
+        throw new Error(`GitHub returned HTTP ${response.status}`);
+      }
+
+      const remoteCode = await response.text();
+
+      if (!remoteCode.trim()) {
+        throw new Error('GitHub returned an empty index.js.');
+      }
+
+      const localCode = fs.readFileSync(__filename, 'utf8');
+
+      if (remoteCode === localCode) {
+        return {
+          ok: true,
+          updated: false,
+          message: 'KatBot is already up to date.',
+        };
+      }
+
+      // Write the downloaded code to a temporary file.
+      fs.writeFileSync(tempFile, remoteCode, 'utf8');
+
+      // Validate the new JavaScript before replacing the current file.
+      const check = spawnSync(
+        process.execPath,
+        ['--check', tempFile],
+        {
+          cwd: __dirname,
+          encoding: 'utf8',
+          timeout: 30000,
+          maxBuffer: 1024 * 1024,
+        }
+      );
+
+      if (check.error) {
+        throw check.error;
+      }
+
+      if (check.status !== 0) {
+        throw new Error(
+          `Downloaded index.js has a syntax error:\n${
+            check.stderr || check.stdout || 'Unknown syntax error'
+          }`
+        );
+      }
+
+      // Replace only index.js. Other files are untouched.
+      fs.renameSync(tempFile, __filename);
+
+      return {
+        ok: true,
+        updated: true,
+        message: 'index.js downloaded and validated successfully.',
+      };
+    } catch (error) {
+      try {
+        if (fs.existsSync(tempFile)) {
+          fs.unlinkSync(tempFile);
+        }
+      } catch {}
+
+      return {
+        ok: false,
+        updated: false,
+        message: `Update failed: ${error.message}`,
+      };
+    } finally {
+      updateRunning = false;
     }
-    return { ok: true, updated: true, message: `Updated from GitHub: ${local.slice(0, 7)} → ${remote.slice(0, 7)}.` };
-  } catch (error) {
-    return { ok: false, updated: false, message: `Update error: ${error.message}` };
-  } finally { updateRunning = false; }
+  })();
 }
+
 function restartBot() {
   if (restartScheduled) return;
+
   restartScheduled = true;
+
   console.log('Starting replacement process...');
-  const child = spawn(process.execPath, [path.join(__dirname, 'index.js')], {
-    cwd: __dirname, env: process.env, detached: true, stdio: 'ignore',
-  });
+
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, 'index.js')],
+    {
+      cwd: __dirname,
+      env: process.env,
+      detached: true,
+      stdio: 'ignore',
+    }
+  );
+
   let spawned = false;
+
   child.once('spawn', () => {
     spawned = true;
     child.unref();
-    console.log('Replacement process spawned; closing current process shortly.');
+
+    console.log('Replacement process started.');
+
     setTimeout(async () => {
-      try { await client.destroy(); } catch (error) { console.error('Error closing Discord client:', error.message); }
+      try {
+        await client.destroy();
+      } catch (error) {
+        console.error('Error closing Discord client:', error.message);
+      }
+
       process.exit(0);
     }, 2500);
   });
+
   child.once('error', error => {
     console.error('Could not start replacement process:', error.message);
     restartScheduled = false;
   });
+
   child.once('exit', (code, signal) => {
     if (!spawned) {
-      console.error(`Replacement process exited before spawn (code ${code}, signal ${signal}).`);
+      console.error(
+        `Replacement process exited before starting (code ${code}, signal ${signal}).`
+      );
       restartScheduled = false;
     }
   });
 }
+
 
 /* -------------------- COMMAND REGISTRATION -------------------- */
 const baseCommands = [
@@ -388,7 +477,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (name === 'update') {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return interaction.reply({ content: 'Only administrators can use /update.', flags: MessageFlags.Ephemeral });
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const result = updateFromGitHub();
+        const result = await updateFromGitHub();
         if (!result.ok || !result.updated) return interaction.editReply(result.message);
         await interaction.editReply(`${result.message}\nRestarting KatBot. It may be offline briefly.`);
         setTimeout(restartBot, 1500);
@@ -533,7 +622,7 @@ client.on(Events.InteractionCreate, async interaction => {
 async function startBot() {
   if (AUTO_UPDATE) {
     console.log('Checking GitHub for updates...');
-    const result = updateFromGitHub();
+    const result = await updateFromGitHub();
     console.log(result.message);
     if (result.ok && result.updated) {
       console.log('Update downloaded. Restarting to load the new version.');
